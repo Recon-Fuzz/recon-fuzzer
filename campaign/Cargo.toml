@@ -1,0 +1,33 @@
+[package]
+name = "campaign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+primitives.workspace = true
+config.workspace = true
+abi.workspace = true
+analysis.workspace = true
+evm.workspace = true
+
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+alloy-json-abi.workspace = true
+alloy-dyn-abi.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+revm = { workspace = true, features = ["std", "serde"] }
+hex-literal.workspace = true
+hex.workspace = true
+chrono = "0.4"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"

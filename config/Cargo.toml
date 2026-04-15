@@ -1,0 +1,13 @@
+[package]
+name = "config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Configuration types for recon-fuzzer"
+
+[dependencies]
+primitives.workspace = true
+alloy-primitives.workspace = true
+serde.workspace = true
+hex-literal.workspace = true

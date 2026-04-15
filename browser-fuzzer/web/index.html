@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Browser EVM Fuzzer</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'SF Mono', 'Fira Code', monospace; background: #0d1117; color: #c9d1d9; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+
+        /* Top bar */
+        #topBar { display: flex; align-items: center; gap: 8px; padding: 6px 12px; background: #161b22; border-bottom: 1px solid #30363d; flex-shrink: 0; flex-wrap: wrap; }
+        #topBar h1 { color: #58a6ff; font-size: 0.95em; white-space: nowrap; margin-right: 4px; }
+        .sep { width: 1px; height: 18px; background: #30363d; flex-shrink: 0; }
+        #topBar select, #topBar input[type="number"] { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 3px 5px; border-radius: 3px; font-family: inherit; font-size: 0.78em; }
+        #topBar select { width: 110px; }
+        #topBar input[type="number"] { width: 90px; }
+        #topBar label { color: #8b949e; font-size: 0.72em; }
+        .top-btn { background: #238636; color: #fff; border: none; padding: 4px 10px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 0.78em; white-space: nowrap; }
+        .top-btn:hover { background: #2ea043; }
+        .top-btn.sec { background: #30363d; }
+        .top-btn.sec:hover { background: #484f58; }
+        .top-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+        #statusText { color: #8b949e; font-size: 0.72em; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 500px; }
+
+        /* Main layout */
+        #main { display: flex; flex: 1; overflow: hidden; }
+
+        /* Left sidebar */
+        #sidebar { width: 260px; min-width: 260px; background: #161b22; border-right: 1px solid #30363d; display: flex; flex-direction: column; overflow-y: auto; }
+        .sec-hdr { color: #58a6ff; font-size: 0.75em; font-weight: 600; padding: 8px 10px 4px; }
+        .sec-body { padding: 0 10px 8px; }
+        .sec-divider { border-bottom: 1px solid #21262d; }
+        #sidebar label { display: block; color: #8b949e; font-size: 0.7em; margin: 5px 0 1px; }
+        #sidebar input[type="file"] { width: 100%; font-size: 0.72em; }
+        #sidebar input[type="file"]::file-selector-button { background: #30363d; color: #c9d1d9; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 0.85em; margin-right: 4px; }
+        #sidebar select, #sidebar input[type="text"], #sidebar input[type="number"] { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 3px 5px; border-radius: 3px; font-family: inherit; font-size: 0.78em; }
+        #sidebar textarea { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 3px 5px; border-radius: 3px; font-family: inherit; font-size: 0.78em; resize: vertical; min-height: 36px; }
+        #sidebar button { background: #238636; color: #fff; border: none; padding: 3px 8px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 0.75em; margin-top: 4px; }
+        #sidebar button:hover { background: #2ea043; }
+        .info-text { color: #8b949e; font-size: 0.7em; margin-top: 2px; }
+        .row2 { display: flex; gap: 6px; }
+        .row2 > div { flex: 1; }
+
+        /* Collapsible */
+        .tog { cursor: pointer; user-select: none; }
+        .tog::before { content: '\25BC '; font-size: 0.65em; color: #484f58; }
+        .hid .tog::before { content: '\25B6 '; }
+        .hid .tog-body { display: none; }
+
+        /* Center: unified output */
+        #center { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+        /* Tests strip */
+        #testStrip { padding: 6px 12px; border-bottom: 1px solid #21262d; flex-shrink: 0; background: #0d1117; }
+        #testResults { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+        .test-item { font-size: 0.78em; white-space: nowrap; }
+
+        /* Log output */
+        #output { flex: 1; overflow-y: auto; padding: 6px 12px; font-size: 0.76em; line-height: 1.45; white-space: pre-wrap; background: #0d1117; }
+        .success { color: #3fb950; }
+        .error { color: #f85149; }
+        .dim { color: #484f58; }
+    </style>
+</head>
+<body>
+    <!-- Top Bar -->
+    <div id="topBar">
+        <h1>recon-fuzzer</h1>
+        <div class="sep"></div>
+        <label>Mode</label>
+        <select id="testModeSelect">
+            <option value="assertion">Assertion</option>
+            <option value="property">Property</option>
+            <option value="optimization">Optimization</option>
+            <option value="exploration">Exploration</option>
+        </select>
+        <label>Runs</label>
+        <input type="number" id="testLimitInput" value="1000000" min="100" step="1000" />
+        <label>Seq</label>
+        <input type="number" id="seqLenInput" value="100" min="1" max="500" />
+        <label>Shrink</label>
+        <input type="number" id="shrinkLimitInput" value="5000" min="100" step="500" />
+        <label>Workers</label>
+        <input type="number" id="workersInput" value="4" min="1" max="32" />
+        <div class="sep"></div>
+        <button class="top-btn" id="btnDeployFuzz" disabled>Deploy & Fuzz</button>
+        <button class="top-btn sec" id="btnStop" disabled>Stop</button>
+        <span id="statusText">Loading WASM...</span>
+    </div>
+
+    <div id="main">
+        <!-- Left Sidebar -->
+        <div id="sidebar">
+            <div class="sec-divider">
+                <div class="sec-hdr">Project</div>
+                <div class="sec-body">
+                    <label>Build Info / Artifacts</label>
+                    <input type="file" id="artifactFiles" multiple accept=".json" />
+                    <label>Config (.yaml)</label>
+                    <input type="file" id="configFile" accept=".yaml,.yml" />
+                    <div id="artifactInfo" class="info-text"></div>
+                    <label>Contract</label>
+                    <select id="contractSelect"><option value="">--</option></select>
+                </div>
+            </div>
+
+            <div class="sec-divider">
+                <div class="sec-hdr">Config</div>
+                <div class="sec-body">
+                    <label>Seed (0 = random)</label>
+                    <input type="number" id="seedInput" value="0" min="0" />
+                    <div class="row2">
+                        <div><label>Time Delay</label><input type="number" id="maxTimeDelayInput" value="604800" min="0" /></div>
+                        <div><label>Block Delay</label><input type="number" id="maxBlockDelayInput" value="60480" min="0" /></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sec-divider" id="manualSection">
+                <div class="sec-hdr tog" onclick="this.parentElement.classList.toggle('hid')">Manual Deploy</div>
+                <div class="sec-body tog-body">
+                    <label>Name</label>
+                    <input type="text" id="manualName" placeholder="MyContract" />
+                    <label>ABI JSON</label>
+                    <textarea id="manualAbi" placeholder='[{"inputs":[],...}]'></textarea>
+                    <label>Bytecode (hex)</label>
+                    <textarea id="manualBytecode" placeholder="0x6080604052..."></textarea>
+                    <button id="btnManualDeploy">Deploy & Fuzz</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Center -->
+        <div id="center">
+            <div id="testStrip">
+                <div id="testResults"></div>
+            </div>
+            <div id="output"></div>
+        </div>
+    </div>
+
+    <script>
+        // Default workers to 4 (can be overridden by config yaml)
+        document.getElementById('workersInput').value = 4;
+    </script>
+    <script type="module" src="app.js"></script>
+</body>
+</html>

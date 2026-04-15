@@ -1,0 +1,12 @@
+[package]
+name = "primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Foundational types, traits, and constants for recon-fuzzer"
+
+[dependencies]
+alloy-primitives.workspace = true
+hex.workspace = true
+rand.workspace = true

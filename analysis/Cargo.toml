@@ -1,0 +1,17 @@
+[package]
+name = "analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Static analysis utilities: Slither info parsing, bytecode constant extraction"
+
+[dependencies]
+primitives.workspace = true
+alloy-primitives.workspace = true
+alloy-dyn-abi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
