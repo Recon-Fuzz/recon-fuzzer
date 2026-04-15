@@ -5,19 +5,12 @@
 
 mod inspector;
 mod source;
-mod unified;
 
 // Re-export all public items from inspector
 pub use inspector::{
     build_codehash_map, compute_metadata_hash, coverage_points, coverage_stats, num_codehashes,
     lookup_codehash, CombinedInspector, CoverageInspector, CoverageMap, CoverageMode, DeploymentPcCounter,
     MetadataToCodehash, TracingWithCheatcodes, TOUCHED_INITIAL_CAPACITY,
-};
-
-// Re-export all public items from unified (CFG-based coverage)
-pub use unified::{
-    BranchCoverageKey, UncoveredBranchInfo, UnifiedBranch, UnifiedContractCoverage,
-    UnifiedCoverage, UnifiedCoverageManifest, UnifiedCoverageStats,
 };
 
 // Re-export all public items from source (source-level LCOV and HTML reports)
