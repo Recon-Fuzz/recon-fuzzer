@@ -17,10 +17,10 @@ alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 alloy-json-abi.workspace = true
 alloy-dyn-abi.workspace = true
-alloy-provider = { version = "2.0", default-features = false, features = ["reqwest"] }
-alloy-rpc-types = "2.0"
-alloy-transport = "2.0"
-alloy-transport-http = "2.0"
+alloy-provider = { version = "1.7", default-features = false, features = ["reqwest"] }
+alloy-rpc-types = "1.7"
+alloy-transport = "1.7"
+alloy-transport-http = "1.7"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
 
 serde.workspace = true

@@ -96,6 +96,7 @@ impl EvmState {
                 cfg.disable_block_gas_limit = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
             })
             .modify_tx_chained(|tx_env| {
                 tx_env.caller = deployer;
@@ -256,6 +257,7 @@ impl EvmState {
                 cfg.disable_block_gas_limit = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
             })
             .modify_tx_chained(|tx_env| {
                 tx_env.caller = deployer;
@@ -907,6 +909,7 @@ impl EvmState {
                 cfg.disable_block_gas_limit = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
             })
             .modify_tx_chained(|tx_env| {
                 tx_env.caller = caller;
@@ -1131,6 +1134,7 @@ impl EvmState {
                 cfg.disable_block_gas_limit = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
             })
             .modify_tx_chained(|tx_env| {
                 tx_env.caller = caller;
