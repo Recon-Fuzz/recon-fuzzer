@@ -396,6 +396,7 @@ impl EvmState {
                 cfg.disable_block_gas_limit = true;
                 cfg.disable_eip3607 = true; // Allow txs from accounts with code
                 cfg.disable_base_fee = true; // Allow zero gas price
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
             })
             .modify_tx_chained(|tx_env| {
                 tx_env.caller = caller;
@@ -527,6 +528,7 @@ impl EvmState {
                 cfg.disable_block_gas_limit = true;
                 cfg.disable_eip3607 = true; // Allow txs from accounts with code
                 cfg.disable_base_fee = true; // Allow zero gas price
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
             })
             .modify_tx_chained(|tx_env| {
                 tx_env.caller = caller;
@@ -686,6 +688,7 @@ impl EvmState {
                 cfg.disable_block_gas_limit = true;
                 cfg.disable_eip3607 = true; // Allow txs from accounts with code
                 cfg.disable_base_fee = true; // Allow zero gas price
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
             })
             .modify_tx_chained(|tx_env| {
                 tx_env.caller = caller;
