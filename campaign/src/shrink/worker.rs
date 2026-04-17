@@ -51,6 +51,14 @@ pub fn shrink_pending_tests_worker(
                 if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                     tracing::error!("Failed to save shrunk reproducer: {}", e);
                 }
+                // Broadcast shrink completion to web UI
+                if let Some(ref web_state) = env.web_state {
+                    web_state.broadcast_test_state_change(
+                        test.test_type.name(),
+                        &test.state,
+                        Some(&test.reproducer),
+                    );
+                }
             } else {
                 let mut vm_for_shrink = initial_vm.clone();
 
@@ -69,9 +77,25 @@ pub fn shrink_pending_tests_worker(
                             tracing::error!("Failed to save shrunk reproducer: {}", e);
                         }
                     }
+                    // Broadcast shrink progress to web UI (every attempt, not just completion)
+                    if let Some(ref web_state) = env.web_state {
+                        web_state.broadcast_test_state_change(
+                            shrunk_test.test_type.name(),
+                            &shrunk_test.state,
+                            Some(&shrunk_test.reproducer),
+                        );
+                    }
                     *test = shrunk_test;
                 } else {
                     test.shrink_attempt();
+                    // Broadcast even failed shrink attempts to update progress counter
+                    if let Some(ref web_state) = env.web_state {
+                        web_state.broadcast_test_state_change(
+                            test.test_type.name(),
+                            &test.state,
+                            Some(&test.reproducer),
+                        );
+                    }
                 }
             }
         }
@@ -117,6 +141,14 @@ pub fn close_and_shrink_optimization_tests(
             test.worker_id = Some(worker.worker_id);
             tests_to_shrink.push(test.test_type.name().to_string());
             any_closed = true;
+            // Broadcast that we're starting to shrink this test
+            if let Some(ref web_state) = env.web_state {
+                web_state.broadcast_test_state_change(
+                    test.test_type.name(),
+                    &test.state,
+                    Some(&test.reproducer),
+                );
+            }
         }
     }
 
@@ -180,6 +212,21 @@ pub fn close_and_shrink_optimization_tests(
                     worker.worker_id,
                     &format!("Shrinking: {} (Ctrl+C again to stop)", progress.join(", ")),
                 );
+                // Broadcast shrinking progress to web UI
+                if let Some(ref web_state) = env.web_state {
+                    for test_ref in &env.test_refs {
+                        let test = test_ref.read();
+                        if test.worker_id == Some(worker.worker_id) {
+                            if let TestState::Large(_) = test.state {
+                                web_state.broadcast_test_state_change(
+                                    test.test_type.name(),
+                                    &test.state,
+                                    Some(&test.reproducer),
+                                );
+                            }
+                        }
+                    }
+                }
             }
             last_progress = Instant::now();
         }
@@ -217,6 +264,14 @@ pub fn close_and_shrink_optimization_tests(
                     if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                         tracing::error!("Failed to save shrunk reproducer: {}", e);
                     }
+                    // Broadcast shrink completion to web UI
+                    if let Some(ref web_state) = env.web_state {
+                        web_state.broadcast_test_state_change(
+                            test.test_type.name(),
+                            &test.state,
+                            Some(&test.reproducer),
+                        );
+                    }
                     continue;
                 }
 
@@ -241,9 +296,25 @@ pub fn close_and_shrink_optimization_tests(
                             tracing::error!("Failed to save shrunk reproducer: {}", e);
                         }
                     }
+                    // Broadcast shrink progress to web UI (every attempt, not just completion)
+                    if let Some(ref web_state) = env.web_state {
+                        web_state.broadcast_test_state_change(
+                            shrunk_test.test_type.name(),
+                            &shrunk_test.state,
+                            Some(&shrunk_test.reproducer),
+                        );
+                    }
                     *test = shrunk_test;
                 } else {
                     test.shrink_attempt();
+                    // Broadcast even failed shrink attempts to update progress counter
+                    if let Some(ref web_state) = env.web_state {
+                        web_state.broadcast_test_state_change(
+                            test.test_type.name(),
+                            &test.state,
+                            Some(&test.reproducer),
+                        );
+                    }
                 }
             }
         }
@@ -266,6 +337,14 @@ pub fn close_and_shrink_optimization_tests(
                 );
                 if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                     tracing::error!("Failed to save shrunk reproducer: {}", e);
+                }
+                // Broadcast shrink completion to web UI
+                if let Some(ref web_state) = env.web_state {
+                    web_state.broadcast_test_state_change(
+                        test.test_type.name(),
+                        &test.state,
+                        Some(&test.reproducer),
+                    );
                 }
             }
         }

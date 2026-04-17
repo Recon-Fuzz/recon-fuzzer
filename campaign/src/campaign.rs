@@ -74,6 +74,7 @@ pub fn run_campaign(
     let arg_clamps = env.arg_clamps.clone();
     let target_functions = env.target_functions.clone();
     let fuzz_templates = env.fuzz_templates.clone();
+    let web_state = env.web_state.clone();
     // Setup-extracted dictionary values (from constructor/setUp traces)
     let setup_dict_values = env.setup_dict_values.clone();
     let setup_dict_addresses = env.setup_dict_addresses.clone();
@@ -129,6 +130,7 @@ pub fn run_campaign(
             let arg_clamps = arg_clamps.clone();
             let target_functions = target_functions.clone();
             let fuzz_templates = fuzz_templates.clone();
+            let web_state = web_state.clone();
             let vm = vm.clone();
             let corpus_chunk = corpus_chunks[worker_id].clone();
             let worker_seed = base_seed.wrapping_add(worker_id as u64);
@@ -164,6 +166,7 @@ pub fn run_campaign(
                     arg_clamps,
                     target_functions,
                     fuzz_templates,
+                    web_state: web_state.clone(),
                     setup_dict_values: setup_dict_values.clone(),
                     setup_dict_addresses: setup_dict_addresses.clone(),
                     setup_dict_signed: setup_dict_signed.clone(),
@@ -352,6 +355,7 @@ pub fn run_shrink_campaign(
     let arg_clamps = env.arg_clamps.clone();
     let target_functions = env.target_functions.clone();
     let fuzz_templates = env.fuzz_templates.clone();
+    let web_state = env.web_state.clone();
     let setup_dict_values = env.setup_dict_values.clone();
     let setup_dict_addresses = env.setup_dict_addresses.clone();
     let setup_dict_signed = env.setup_dict_signed.clone();
@@ -380,6 +384,7 @@ pub fn run_shrink_campaign(
             let arg_clamps = arg_clamps.clone();
             let target_functions = target_functions.clone();
             let fuzz_templates = fuzz_templates.clone();
+            let web_state = web_state.clone();
             let vm = vm.clone();
             let worker_seed = base_seed.wrapping_add(worker_id as u64);
             let setup_dict_values = setup_dict_values.clone();
@@ -407,6 +412,7 @@ pub fn run_shrink_campaign(
                     arg_clamps,
                     target_functions,
                     fuzz_templates,
+                    web_state,
                     setup_dict_values,
                     setup_dict_addresses,
                     setup_dict_signed,

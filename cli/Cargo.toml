@@ -13,6 +13,7 @@ analysis.workspace = true
 campaign.workspace = true
 config.workspace = true
 evm.workspace = true
+recon-web.workspace = true
 
 
 clap.workspace = true

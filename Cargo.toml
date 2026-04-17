@@ -8,10 +8,11 @@ members = [
     "cli",
     "campaign",
     "abi",
+    "web-core",
 ]
 
 [workspace.package]
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 license = "GPL-2.0"
 authors = ["Recon-Fuzzer Contributors"]
@@ -59,6 +60,7 @@ analysis = { path = "analysis" }
 campaign = { path = "campaign" }
 abi = { path = "abi" }
 evm = { path = "evm" }
+recon-web = { path = "web-core" }
 
 # Hex encoding
 hex = "0.4"
