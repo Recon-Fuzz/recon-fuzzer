@@ -148,6 +148,16 @@ Examples below.
 | `--shortcuts` | Run `shortcut_*` functions at startup to bootstrap the corpus |
 | `--shrink-limit <N>` | Shrink attempts per failing test (default: 5000) |
 
+## Web UI (experimental)
+
+Recon ships an optional browser UI for watching a campaign live. Pass `--web` to a `recon fuzz` run:
+
+```bash
+recon fuzz . --web
+```
+
+> **Experimental.** This is still rough — not all features are wired up and the frontend is under active development. Treat it as an early preview, not a finished product. The CLI remains the supported way to run campaigns.
+
 ## Configuration file
 
 Recon understands the Echidna-style `echidna.yaml`. CLI flags override file values.

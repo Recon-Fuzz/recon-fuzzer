@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::testing::EchidnaTest;
+use crate::web::WebObservableState;
 use crate::worker_env::CorpusEntry;
 use crate::world::World;
 
@@ -97,6 +98,9 @@ pub struct Env {
     /// Prioritized sequences with wildcards like "f(1,?,?) ; g(?,2,5)"
     pub fuzz_templates: Arc<RwLock<Vec<crate::transaction::FuzzSequenceTemplate>>>,
 
+    /// Web UI state (for recording statistics from workers)
+    /// Set by spawn_web_server, accessed by workers to record call/sequence stats
+    pub web_state: Option<Arc<WebObservableState>>,
 }
 
 impl Env {
@@ -142,6 +146,7 @@ impl Env {
             arg_clamps: Arc::new(RwLock::new(HashMap::new())),
             target_functions: Arc::new(RwLock::new(std::collections::HashSet::new())),
             fuzz_templates: Arc::new(RwLock::new(Vec::new())),
+            web_state: None,
         }
     }
 

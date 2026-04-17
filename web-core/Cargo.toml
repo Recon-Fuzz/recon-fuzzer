@@ -1,0 +1,45 @@
+[package]
+name = "recon-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web UI backend for recon-fuzzer"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# Async runtime
+tokio.workspace = true
+tokio-tungstenite = "0.28"
+futures = "0.3"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Concurrency
+parking_lot = "0.12"
+
+# Logging
+tracing.workspace = true
+
+# Ethereum primitives
+alloy-primitives.workspace = true
+alloy-json-abi.workspace = true
+alloy-dyn-abi.workspace = true
+
+# Internal crates
+evm.workspace = true
+config.workspace = true
+
+# TLS (self-signed cert for wss:// from HTTPS pages)
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+
+# Utils
+hex.workspace = true

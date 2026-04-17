@@ -17,3 +17,4 @@ pub mod transaction;
 pub mod types;
 pub mod worker_env;
 pub mod world;
+pub mod web;

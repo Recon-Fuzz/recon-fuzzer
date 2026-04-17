@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use campaign::campaign::run_campaign;
 use campaign::config::Env;
 use campaign::corpus::load_corpus;
+use campaign::web::WebObservableState;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,6 +151,16 @@ struct FuzzArgs {
     #[arg(long)]
     shortcuts: bool,
 
+    /// Enable web UI for interactive fuzzing.
+    /// Without a value, opens the default hosted UI (or FUZZER_WEB_URL env var).
+    /// With a URL, opens that specific frontend (e.g. --web localhost:3000 for local dev).
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    web: Option<String>,
+
+    /// Port for web UI WebSocket server (default: 4444)
+    #[arg(long)]
+    web_port: Option<u16>,
+
     /// Shrink-only mode: skip fuzzing, load existing reproducers, and shrink them
     #[arg(long)]
     shrink: bool,
@@ -213,6 +224,96 @@ struct FlatConfig {
     // Shortcuts hoisting
     #[serde(rename = "shortcutsEnable")]
     shortcuts_enable: Option<bool>,
+}
+
+/// Default production URL for the hosted web UI
+const DEFAULT_WEB_UI_URL: &str = "https://recon-fuzzer.vercel.app";
+
+/// Spawn the WebSocket backend and open the frontend URL in the browser.
+/// Returns Arc<WebObservableState> - the web state must be stored in env.
+///
+/// When web mode is enabled:
+/// - N workers are used for fuzzing (0..N-1)
+/// - Worker N is the "interactive" worker for web UI commands
+///
+/// The `frontend_url` is always opened with ?ws=ws://localhost:{port}/ws appended.
+fn spawn_web_server(
+    env: &Env,
+    deployed_addresses: Vec<(Address, String)>,
+    port: Option<u16>,
+    stop_flag: Option<Arc<AtomicBool>>,
+    frontend_url: &str,
+) -> Result<((), Arc<WebObservableState>)> {
+    use std::sync::Arc;
+
+    let port = port.unwrap_or(4444);
+    // N fuzzing workers + 1 interactive worker for web UI
+    let num_fuzzing_workers = env.cfg.campaign_conf.workers as usize;
+    let total_workers = num_fuzzing_workers + 1; // +1 for interactive worker
+
+    // Create the observable state wrapper
+    // This clones the Arc references from env, so updates are shared
+    // The last worker (index N) is marked as the interactive worker
+    let mut web_state_inner = WebObservableState::new_with_interactive(
+        env,
+        num_fuzzing_workers,
+        total_workers,
+        deployed_addresses,
+    );
+
+    // Set up stop flag if provided
+    if let Some(ref flag) = stop_flag {
+        web_state_inner.set_stop_flag(flag.clone());
+    }
+
+    // Build and spawn the WebSocket server
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to create tokio runtime for web server")?;
+
+    let config = recon_web::WebServerConfig {
+        port,
+        bind_address: "0.0.0.0".to_string(),
+        static_dir: None,
+        update_interval_ms: 100,
+        ..Default::default()
+    };
+
+    // Create a shared broadcast channel for immediate notifications
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel(1024);
+    web_state_inner.set_broadcast_sender(broadcast_tx.clone());
+
+    let web_state = Arc::new(web_state_inner);
+
+    // Clone for the server (server takes ownership)
+    let web_state_for_server = web_state.clone();
+
+    let server =
+        recon_web::WebServer::new_with_broadcast(web_state_for_server, config, broadcast_tx);
+
+    // Spawn the server in a background thread
+    std::thread::spawn(move || {
+        runtime.block_on(async {
+            if let Err(e) = server.run().await {
+                error!("Web server error: {}", e);
+            }
+        });
+    });
+
+    info!("WebSocket server started on ws://0.0.0.0:{}/ws", port);
+
+    // Normalize the frontend URL
+    let full_url = if !frontend_url.contains("://") {
+        format!("http://{}", frontend_url)
+    } else {
+        frontend_url.to_string()
+    };
+
+    info!("Opening web UI: {}", full_url);
+    recon_web::open_browser(&full_url);
+
+    Ok(((), web_state))
 }
 
 fn main() -> Result<()> {
@@ -1027,7 +1128,40 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     // Save initial VM state for trace generation at the end
     let initial_vm = vm.clone();
 
+    // Spawn web UI server if --web is set
+    let web_mode = args.web.is_some();
+    if web_mode {
+        // Resolve the frontend URL:
+        // --web <url>  →  use that URL directly
+        // --web        →  FUZZER_WEB_URL env var, or production default
+        let web_url_arg = args.web.as_deref().unwrap_or("");
+        let frontend_url = if !web_url_arg.is_empty() {
+            web_url_arg.to_string()
+        } else {
+            std::env::var("FUZZER_WEB_URL")
+                .unwrap_or_else(|_| DEFAULT_WEB_UI_URL.to_string())
+        };
+
+        let ((), web_state) = spawn_web_server(
+            &env,
+            deployed_addresses.clone(),
+            args.web_port,
+            Some(stop_flag.clone()),
+            &frontend_url,
+        )?;
+        // Store web_state in env so workers can record statistics
+        env.web_state = Some(web_state.clone());
+
+        // Set initial VM state for replay functionality
+        web_state.set_initial_vm(initial_vm.clone());
+    }
+
     let stop_flag_check = stop_flag.clone();
+
+    // Set campaign state to Running just before starting (starts the timer)
+    if let Some(ref web_state) = env.web_state {
+        web_state.set_campaign_state(recon_web::CampaignState::Running);
+    }
 
     // Run the campaign
     run_campaign(
@@ -1037,6 +1171,15 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         stop_flag.clone(),
         force_stop.clone(),
     )?;
+
+    // Update campaign state if in web mode
+    if let Some(ref web_state) = env.web_state {
+        if stop_flag_check.load(Ordering::Relaxed) {
+            web_state.set_campaign_state(recon_web::CampaignState::Finished);
+        } else {
+            web_state.set_campaign_state(recon_web::CampaignState::Finished);
+        }
+    }
 
     // Export corpus to Echidna format if requested
     if let Some(ref export_dir) = env.cfg.campaign_conf.export_dir {
@@ -1221,6 +1364,23 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     println!("Seed: {}", seed);
 
     println!();
+
+    // If in web mode, keep running so user can investigate results
+    if web_mode {
+        info!(
+            "Campaign finished. Web UI is still running for investigation. Press Ctrl+C to exit."
+        );
+
+        // Keep the web server alive until user exits
+        loop {
+            // Check if user wants to exit
+            if force_stop.load(Ordering::Relaxed) {
+                info!("Received exit signal, shutting down...");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 
     // Exit with appropriate code
     if any_failed {

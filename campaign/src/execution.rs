@@ -812,6 +812,16 @@ pub fn execute_sequence_worker_with_checkpoints(
         // Use actual gas consumed, not gas limit (vm'.burned - vm.burned)
         let gas_used = vm.get_last_gas_used();
         worker.total_gas += gas_used;
+
+        // Record call stats for web UI
+        if let Some(ref web_state) = env.web_state {
+            web_state.record_call(worker.worker_id, gas_used);
+        }
+    }
+
+    // Record sequence completion for web UI
+    if let Some(ref web_state) = env.web_state {
+        web_state.record_sequence(worker.worker_id);
     }
 
     Ok(((results, new_coverage), optimization_improved))
@@ -1042,6 +1052,16 @@ pub fn execute_sequence_worker(
         // Use actual gas consumed, not gas limit (vm'.burned - vm.burned)
         let gas_used = vm.get_last_gas_used();
         worker.total_gas += gas_used;
+
+        // Record call stats for web UI
+        if let Some(ref web_state) = env.web_state {
+            web_state.record_call(worker.worker_id, gas_used);
+        }
+    }
+
+    // Record sequence completion for web UI
+    if let Some(ref web_state) = env.web_state {
+        web_state.record_sequence(worker.worker_id);
     }
 
     Ok((results, new_coverage))

@@ -10,6 +10,7 @@ use parking_lot::RwLock;
 
 use crate::config::Env;
 use crate::testing::EchidnaTest;
+use crate::web::WebObservableState;
 use crate::world::World;
 
 /// Corpus entry type: (priority, Arc-wrapped transaction sequence)
@@ -45,6 +46,8 @@ pub struct WorkerEnv {
     pub target_functions: Arc<RwLock<std::collections::HashSet<String>>>,
     /// Fuzz transaction templates with wildcards
     pub fuzz_templates: Arc<RwLock<Vec<crate::transaction::FuzzSequenceTemplate>>>,
+    /// Web UI state (for recording statistics from workers)
+    pub web_state: Option<Arc<WebObservableState>>,
     /// Dictionary values extracted from setUp traces (U256)
     pub setup_dict_values: Vec<U256>,
     /// Dictionary addresses extracted from setUp traces
@@ -76,6 +79,7 @@ impl From<&Env> for WorkerEnv {
             arg_clamps: env.arg_clamps.clone(),
             target_functions: env.target_functions.clone(),
             fuzz_templates: env.fuzz_templates.clone(),
+            web_state: env.web_state.clone(),
             setup_dict_values: env.setup_dict_values.clone(),
             setup_dict_addresses: env.setup_dict_addresses.clone(),
             setup_dict_signed: env.setup_dict_signed.clone(),

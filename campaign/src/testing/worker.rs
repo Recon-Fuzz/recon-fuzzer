@@ -14,6 +14,7 @@ use crate::types::WorkerState;
 use crate::worker_env::WorkerEnv;
 
 /// Check CallTest, AssertionTest, PropertyTest, and OptimizationTest after each transaction (WorkerEnv variant)
+/// ECHIDNA PARITY: Echidna checks ALL tests (including optimization) after EACH transaction,
 /// not just at the end of the sequence. This is critical for finding better optimization
 /// values at intermediate states!
 pub fn check_tests_after_tx_worker(
@@ -41,7 +42,7 @@ pub fn check_tests_after_tx_worker(
             continue;
         }
 
-        // Check PropertyTest and OptimizationTest via check_etest
+        // ECHIDNA PARITY: Check PropertyTest and OptimizationTest via check_etest
         // (which calls the test function as a separate transaction)
         // Check CallTest and AssertionTest directly (they examine the current VM state)
         let (val, res) = match &test.test_type {
@@ -50,6 +51,8 @@ pub fn check_tests_after_tx_worker(
                 signature, addr, ..
             } => check_assertion(vm, signature, *addr)?,
 
+            // CRITICAL FIX: Check PropertyTest and OptimizationTest after each tx!
+            // Echidna does this in updateTests(updateOpenTest vm (reverse executedSoFar))
             TestType::PropertyTest { .. } | TestType::OptimizationTest { .. } => {
                 let mut check_vm = vm.clone();
                 check_etest(&mut check_vm, &test, sender)?
@@ -93,6 +96,41 @@ pub fn check_tests_after_tx_worker(
                             worker.gen_dict.record_optimization_improving_values(args);
                         }
                     }
+                    // Broadcast optimization improvement to web UI (realtime update)
+                    // Include the optimization test call itself so replay shows the result
+                    if let Some(ref web_state) = env.web_state {
+                        if let TestType::OptimizationTest { name, addr } = &test.test_type {
+                            // Build sequence with optimization test call appended
+                            let sender = test.reproducer.last().map(|tx| tx.src).unwrap_or(*addr);
+                            let opt_test_tx = evm::types::Tx {
+                                call: evm::types::TxCall::SolCall {
+                                    name: name.clone(),
+                                    args: vec![],
+                                },
+                                src: sender,
+                                dst: *addr,
+                                gasprice: alloy_primitives::U256::ZERO,
+                                value: alloy_primitives::U256::ZERO,
+                                gas: 12_500_000,
+                                delay: (0, 0),
+                            };
+                            let mut seq_with_test = test.reproducer.clone();
+                            seq_with_test.push(opt_test_tx);
+                            web_state.broadcast_test_state_change_with_value(
+                                test.test_type.name(),
+                                &test.state,
+                                Some(&seq_with_test),
+                                Some(&test.value),
+                            );
+                        } else {
+                            web_state.broadcast_test_state_change_with_value(
+                                test.test_type.name(),
+                                &test.state,
+                                Some(&test.reproducer),
+                                Some(&test.value),
+                            );
+                        }
+                    }
                     // NOTE: Don't save reproducer here - save at end of sequence only
                     // to avoid excessive I/O. The test state is updated and will be
                     // saved in check_tests_worker or at campaign end.
@@ -109,6 +147,14 @@ pub fn check_tests_after_tx_worker(
                     println!();
                     if let Err(e) = output::save_unshrunk_reproducer_worker(env, executed_so_far) {
                         tracing::error!("Failed to save reproducer: {}", e);
+                    }
+                    // Broadcast test failure immediately to web UI
+                    if let Some(ref web_state) = env.web_state {
+                        web_state.broadcast_test_state_change(
+                            test.test_type.name(),
+                            &test.state,
+                            Some(&test.reproducer),
+                        );
                     }
                 }
             }
@@ -135,6 +181,14 @@ pub fn check_tests_after_tx_worker(
 
             if let Err(e) = output::save_unshrunk_reproducer_worker(env, executed_so_far) {
                 tracing::error!("Failed to save reproducer: {}", e);
+            }
+            // Broadcast test failure immediately to web UI
+            if let Some(ref web_state) = env.web_state {
+                web_state.broadcast_test_state_change(
+                    test.test_type.name(),
+                    &test.state,
+                    Some(&test.reproducer),
+                );
             }
         }
     }
@@ -193,13 +247,21 @@ pub fn check_cheap_tests_after_tx_worker(
             if let Err(e) = output::save_unshrunk_reproducer_worker(env, executed_so_far) {
                 tracing::error!("Failed to save reproducer: {}", e);
             }
+            // Broadcast test failure immediately to web UI
+            if let Some(ref web_state) = env.web_state {
+                web_state.broadcast_test_state_change(
+                    test.test_type.name(),
+                    &test.state,
+                    Some(&test.reproducer),
+                );
+            }
         }
     }
     Ok(())
 }
 
 /// Check PropertyTest, CallTest, AssertionTest after each tx (skip OptimizationTest for performance)
-/// PropertyTest MUST be checked after every tx - this is critical for bug-finding!
+/// ECHIDNA PARITY: PropertyTest MUST be checked after every tx - this is critical for bug-finding!
 /// OptimizationTest can be batched since missing intermediate values is acceptable trade-off
 pub fn check_tests_without_optimization_worker(
     env: &WorkerEnv,
@@ -269,6 +331,14 @@ pub fn check_tests_without_optimization_worker(
                 if let Err(e) = output::save_unshrunk_reproducer_worker(env, executed_so_far) {
                     tracing::error!("Failed to save reproducer: {}", e);
                 }
+                // Broadcast test failure immediately to web UI
+                if let Some(ref web_state) = env.web_state {
+                    web_state.broadcast_test_state_change(
+                        test.test_type.name(),
+                        &test.state,
+                        Some(&test.reproducer),
+                    );
+                }
             }
             continue;
         }
@@ -293,6 +363,14 @@ pub fn check_tests_without_optimization_worker(
 
             if let Err(e) = output::save_unshrunk_reproducer_worker(env, executed_so_far) {
                 tracing::error!("Failed to save reproducer: {}", e);
+            }
+            // Broadcast test failure immediately to web UI
+            if let Some(ref web_state) = env.web_state {
+                web_state.broadcast_test_state_change(
+                    test.test_type.name(),
+                    &test.state,
+                    Some(&test.reproducer),
+                );
             }
         }
     }
@@ -368,7 +446,7 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
                         ),
                     );
 
-                    // SAVE REPRODUCER IMMEDIATELY when optimization improves 
+                    // SAVE REPRODUCER IMMEDIATELY when optimization improves (Echidna parity)
                     // Don't defer to check_tests_worker - that uses faulty length-based heuristic
                     if let Err(e) =
                         output::save_optimization_reproducer_worker(env, &test.reproducer)
@@ -419,6 +497,41 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
                         }
                     }
 
+                    // Broadcast optimization improvement to web UI (realtime update)
+                    // Include the optimization test call itself so replay shows the result
+                    if let Some(ref web_state) = env.web_state {
+                        if let TestType::OptimizationTest { name, addr } = &test.test_type {
+                            // Build sequence with optimization test call appended
+                            let sender = test.reproducer.last().map(|tx| tx.src).unwrap_or(*addr);
+                            let opt_test_tx = evm::types::Tx {
+                                call: evm::types::TxCall::SolCall {
+                                    name: name.clone(),
+                                    args: vec![],
+                                },
+                                src: sender,
+                                dst: *addr,
+                                gasprice: alloy_primitives::U256::ZERO,
+                                value: alloy_primitives::U256::ZERO,
+                                gas: 12_500_000,
+                                delay: (0, 0),
+                            };
+                            let mut seq_with_test = test.reproducer.clone();
+                            seq_with_test.push(opt_test_tx);
+                            web_state.broadcast_test_state_change_with_value(
+                                test.test_type.name(),
+                                &test.state,
+                                Some(&seq_with_test),
+                                Some(&test.value),
+                            );
+                        } else {
+                            web_state.broadcast_test_state_change_with_value(
+                                test.test_type.name(),
+                                &test.state,
+                                Some(&test.reproducer),
+                                Some(&test.value),
+                            );
+                        }
+                    }
                 } else if matches!(val, TestValue::BoolValue(false)) {
                     output::print_worker_msg(
                         worker.worker_id,
@@ -431,6 +544,14 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
                     println!();
                     if let Err(e) = output::save_unshrunk_reproducer_worker(env, executed_so_far) {
                         tracing::error!("Failed to save reproducer: {}", e);
+                    }
+                    // Broadcast test failure immediately to web UI
+                    if let Some(ref web_state) = env.web_state {
+                        web_state.broadcast_test_state_change(
+                            test.test_type.name(),
+                            &test.state,
+                            Some(&test.reproducer),
+                        );
                     }
                 }
             }
@@ -458,6 +579,14 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
             if let Err(e) = output::save_unshrunk_reproducer_worker(env, executed_so_far) {
                 tracing::error!("Failed to save reproducer: {}", e);
             }
+            // Broadcast test failure immediately to web UI
+            if let Some(ref web_state) = env.web_state {
+                web_state.broadcast_test_state_change(
+                    test.test_type.name(),
+                    &test.state,
+                    Some(&test.reproducer),
+                );
+            }
         }
     }
     Ok(optimization_improved)
@@ -474,6 +603,7 @@ pub fn check_tests_worker(
     _worker: &mut WorkerState,
 ) -> anyhow::Result<()> {
     // PropertyTest and OptimizationTest are checked per-tx in check_tests_after_tx_worker
+    // (matching Echidna's evalSeq behavior).
     // Optimization reproducers are now saved immediately when the value improves,
     // not deferred here with a faulty length-based heuristic.
     Ok(())
