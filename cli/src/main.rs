@@ -161,6 +161,10 @@ struct FuzzArgs {
     #[arg(long)]
     web_port: Option<u16>,
 
+    /// Don't open the browser automatically when --web is set
+    #[arg(long)]
+    no_open: bool,
+
     /// Shrink-only mode: skip fuzzing, load existing reproducers, and shrink them
     #[arg(long)]
     shrink: bool,
@@ -243,6 +247,7 @@ fn spawn_web_server(
     port: Option<u16>,
     stop_flag: Option<Arc<AtomicBool>>,
     frontend_url: &str,
+    open_browser: bool,
 ) -> Result<((), Arc<WebObservableState>)> {
     use std::sync::Arc;
 
@@ -310,8 +315,12 @@ fn spawn_web_server(
         frontend_url.to_string()
     };
 
-    info!("Opening web UI: {}", full_url);
-    recon_web::open_browser(&full_url);
+    if open_browser {
+        info!("Opening web UI: {}", full_url);
+        recon_web::open_browser(&full_url);
+    } else {
+        info!("Web UI ready: {} (browser not opened: --no-open)", full_url);
+    }
 
     Ok(((), web_state))
 }
@@ -1148,6 +1157,7 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
             args.web_port,
             Some(stop_flag.clone()),
             &frontend_url,
+            !args.no_open,
         )?;
         // Store web_state in env so workers can record statistics
         env.web_state = Some(web_state.clone());
