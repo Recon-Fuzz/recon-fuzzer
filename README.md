@@ -339,4 +339,5 @@ Large portions of this codebase were written with the assistance of AI coding to
 ## Support
 
 - Issues: https://github.com/Recon-Fuzz/recon-fuzzer/issues
-- Discord: https://discord.gg/47eCfmbC
+- Discord: https://getrecon.xyz/discord
+
