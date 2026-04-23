@@ -468,7 +468,7 @@ fn extract_raw_values(
 pub fn generate_sequence_worker_cached(
     env: &WorkerEnv,
     rng: &mut impl Rng,
-    dict: &GenDict,
+    dict: &mut GenDict,
     cached_fuzzable: &[alloy_json_abi::Function],
     cached_assert_functions: &std::collections::HashSet<String>,
     cached_resolved_relations: &std::collections::HashMap<String, analysis::slither::ResolvedRelations>,
@@ -583,11 +583,11 @@ pub fn generate_sequence_worker_cached(
         DEFAULT_MUTATION_CONSTS,
     };
 
-    let mutation = if seq_len == 1 {
-        seq_mutators_stateless(rng, DEFAULT_MUTATION_CONSTS)
-    } else {
-        seq_mutators_stateful(rng, DEFAULT_MUTATION_CONSTS)
-    };
+    // 15% chance: generate completely fresh sequence, bypassing corpus entirely.
+    // Prevents corpus fixation where all sequences orbit similar state paths.
+    // Inspired by medusa's NewSequenceProbability (30%). We use 15% to preserve
+    // more corpus-driven exploration which Echidna proves effective.
+    const FRESH_SEQUENCE_PROBABILITY: f64 = 0.10;
 
     // Corpus uses Arc<Vec<Tx>> - clone is cheap (just ref count increment)
     let corpus = env.corpus_ref.read();
@@ -611,9 +611,14 @@ pub fn generate_sequence_worker_cached(
     // This ensures newer/higher-priority sequences come first in weighted selection
     corpus_with_priority.sort_by(|a, b| b.0.cmp(&a.0));
 
-    if corpus_with_priority.is_empty() {
+    if corpus_with_priority.is_empty() || rng.gen::<f64>() < FRESH_SEQUENCE_PROBABILITY {
         Ok(sequence)
     } else {
+        let mutation = if seq_len == 1 {
+            seq_mutators_stateless(rng, DEFAULT_MUTATION_CONSTS)
+        } else {
+            seq_mutators_stateful(rng, DEFAULT_MUTATION_CONSTS)
+        };
         let mutated_seq =
             apply_corpus_mutation(rng, mutation, seq_len, &corpus_with_priority, &sequence);
         Ok(mutated_seq)

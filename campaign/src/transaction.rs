@@ -179,7 +179,7 @@ fn parse_single_arg(input: &str) -> Result<TemplateArg, String> {
 /// Generate a transaction from a template, filling wildcards with fuzzed values
 pub fn gen_tx_from_template<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     world: &World,
     tx_conf: &TxConf,
     contract: &CompiledContract,
@@ -262,7 +262,7 @@ pub fn gen_tx_from_template<R: Rng>(
         gen_value(
             rng,
             tx_conf.max_value,
-            &dict.dict_values,
+            &mut dict.dict_values,
             &world.payable_sigs,
             &selector,
         )
@@ -273,7 +273,7 @@ pub fn gen_tx_from_template<R: Rng>(
         rng,
         tx_conf.max_time_delay,
         tx_conf.max_block_delay,
-        &dict.dict_values,
+        &mut dict.dict_values,
     );
 
     Some(Tx {
@@ -293,7 +293,7 @@ pub fn gen_tx_from_template<R: Rng>(
 /// Generate a full sequence from a template sequence
 pub fn gen_sequence_from_template<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     world: &World,
     tx_conf: &TxConf,
     contract: &CompiledContract,
@@ -489,7 +489,7 @@ fn parse_json_to_sol_value(json: &serde_json::Value, ty: &DynSolType) -> Option<
 /// This avoids wasting fuzzing effort on view functions that can't fail.
 pub fn gen_tx_smart<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     world: &World,
     tx_conf: &TxConf,
     contract: &CompiledContract,
@@ -516,7 +516,7 @@ pub fn gen_tx_smart<R: Rng>(
     let value = gen_value(
         rng,
         tx_conf.max_value,
-        &dict.dict_values,
+        &mut dict.dict_values,
         &world.payable_sigs,
         &selector,
     );
@@ -525,7 +525,7 @@ pub fn gen_tx_smart<R: Rng>(
         rng,
         tx_conf.max_time_delay,
         tx_conf.max_block_delay,
-        &dict.dict_values,
+        &mut dict.dict_values,
     );
 
     Some(Tx {
@@ -546,7 +546,7 @@ pub fn gen_tx_smart<R: Rng>(
 /// successful calls like initSequence(42) with high probability.
 pub fn gen_tx<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     world: &World,
     tx_conf: &TxConf,
     contract: &CompiledContract,
@@ -573,7 +573,7 @@ pub fn gen_tx<R: Rng>(
     let value = gen_value(
         rng,
         tx_conf.max_value,
-        &dict.dict_values,
+        &mut dict.dict_values,
         &world.payable_sigs,
         &selector,
     );
@@ -583,7 +583,7 @@ pub fn gen_tx<R: Rng>(
         rng,
         tx_conf.max_time_delay,
         tx_conf.max_block_delay,
-        &dict.dict_values,
+        &mut dict.dict_values,
     );
 
     Some(Tx {
@@ -604,7 +604,7 @@ pub fn gen_tx<R: Rng>(
 /// Avoids recomputing fuzzable_functions_smart and resolve_wrapper_relations on every call
 pub fn gen_tx_with_cached_fuzzable<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     world: &World,
     tx_conf: &TxConf,
     contract: &CompiledContract,
@@ -642,7 +642,7 @@ pub fn gen_tx_with_cached_fuzzable<R: Rng>(
     let value = gen_value(
         rng,
         tx_conf.max_value,
-        &dict.dict_values,
+        &mut dict.dict_values,
         &world.payable_sigs,
         &selector,
     );
@@ -650,7 +650,7 @@ pub fn gen_tx_with_cached_fuzzable<R: Rng>(
         rng,
         tx_conf.max_time_delay,
         tx_conf.max_block_delay,
-        &dict.dict_values,
+        &mut dict.dict_values,
     );
 
     Some(Tx {
@@ -667,7 +667,7 @@ pub fn gen_tx_with_cached_fuzzable<R: Rng>(
 /// PERF OPTIMIZED: Simple version for when we don't have relations
 pub fn gen_tx_with_cached_fuzzable_simple<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     world: &World,
     tx_conf: &TxConf,
     contract: &CompiledContract,
@@ -699,7 +699,7 @@ pub fn gen_tx_with_cached_fuzzable_simple<R: Rng>(
     let value = gen_value(
         rng,
         tx_conf.max_value,
-        &dict.dict_values,
+        &mut dict.dict_values,
         &world.payable_sigs,
         &selector,
     );
@@ -707,7 +707,7 @@ pub fn gen_tx_with_cached_fuzzable_simple<R: Rng>(
         rng,
         tx_conf.max_time_delay,
         tx_conf.max_block_delay,
-        &dict.dict_values,
+        &mut dict.dict_values,
     );
 
     Some(Tx {
@@ -727,7 +727,7 @@ pub fn gen_tx_with_cached_fuzzable_simple<R: Rng>(
 fn gen_value<R: Rng>(
     rng: &mut R,
     max_value: U256,
-    dict_values: &std::collections::BTreeSet<U256>,
+    dict_values: &mut abi::types::CachedSet<U256>,
     payable_sigs: &[alloy_primitives::FixedBytes<4>],
     selector: &alloy_primitives::FixedBytes<4>,
 ) -> U256 {
@@ -752,22 +752,19 @@ fn gen_value<R: Rng>(
 }
 
 /// Pick a value from dictionary, modulo max+1
-/// BTreeSet maintains sorted order, so iteration is deterministic (matches Haskell's Data.Set)
 fn from_dict_value<R: Rng>(
     rng: &mut R,
-    dict_values: &std::collections::BTreeSet<U256>,
+    dict_values: &mut abi::types::CachedSet<U256>,
     max: U256,
 ) -> U256 {
     if dict_values.is_empty() {
         return gen_random_value(rng, max);
     }
-    // BTreeSet iteration is already sorted, just collect and pick
-    let values: Vec<_> = dict_values.iter().collect();
-    let picked = values[rng.gen_range(0..values.len())];
+    let picked = *dict_values.random_pick(rng).unwrap();
     if max.is_zero() {
         U256::ZERO
     } else {
-        *picked % (max + U256::from(1))
+        picked % (max + U256::from(1))
     }
 }
 
@@ -786,7 +783,7 @@ fn gen_delay<R: Rng>(
     rng: &mut R,
     max_time: u64,
     max_block: u64,
-    dict_values: &std::collections::BTreeSet<U256>,
+    dict_values: &mut abi::types::CachedSet<U256>,
 ) -> (u64, u64) {
     let time = gen_single_delay(rng, max_time, dict_values);
     let block = gen_single_delay(rng, max_block, dict_values);
@@ -800,11 +797,10 @@ fn gen_delay<R: Rng>(
 }
 
 /// Generate a single delay value using dict or random
-/// BTreeSet maintains sorted order, so iteration is deterministic (matches Haskell's Data.Set)
 fn gen_single_delay<R: Rng>(
     rng: &mut R,
     max: u64,
-    dict_values: &std::collections::BTreeSet<U256>,
+    dict_values: &mut abi::types::CachedSet<U256>,
 ) -> u64 {
     if max == 0 {
         return 0;
@@ -812,10 +808,7 @@ fn gen_single_delay<R: Rng>(
 
     // oftenUsually: 91% from dict, 9% random
     if often_usually_bool(rng) && !dict_values.is_empty() {
-        // Pick from dict and mod by max+1
-        // BTreeSet iteration is already sorted, just collect and pick
-        let values: Vec<_> = dict_values.iter().collect();
-        let picked = values[rng.gen_range(0..values.len())];
+        let picked = *dict_values.random_pick(rng).unwrap();
         let as_u64: u64 = picked.try_into().unwrap_or(u64::MAX);
         as_u64 % (max + 1)
     } else {
@@ -845,7 +838,7 @@ fn usually_very_rarely_bool<R: Rng>(rng: &mut R) -> bool {
 /// Generate a random sequence of transactions
 pub fn rand_seq<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     world: &World,
     tx_conf: &TxConf,
     contract: &CompiledContract,

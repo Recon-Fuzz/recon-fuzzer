@@ -7,7 +7,7 @@ use alloy_json_abi::Function;
 use alloy_primitives::{Address, Bytes, U256};
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use crate::abi::types::CachedSet;
 
 use crate::abi::mutate::mutate_call_enhanced;
 use crate::abi::mutable::Mutable;
@@ -101,7 +101,7 @@ fn gen_abi_call_for_func<R: Rng>(
 /// This matches the main fuzzer pattern: `contract.get_param_types(&selector)`.
 pub fn gen_tx<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     fuzzable_funcs: &[Function],
     contract_addr: Address,
     max_value: U256,
@@ -133,8 +133,8 @@ pub fn gen_tx<R: Rng>(
     let mut calldata = selector.to_vec();
     calldata.extend(encoded_args);
 
-    let value = gen_value(rng, max_value, &dict.dict_values, func);
-    let delay = gen_delay(rng, max_time_delay, max_block_delay, &dict.dict_values);
+    let value = gen_value(rng, max_value, &mut dict.dict_values, func);
+    let delay = gen_delay(rng, max_time_delay, max_block_delay, &mut dict.dict_values);
 
     Some(Tx {
         function_name: name,
@@ -151,7 +151,7 @@ pub fn gen_tx<R: Rng>(
 /// Generate a random sequence of transactions
 pub fn rand_seq<R: Rng>(
     rng: &mut R,
-    dict: &GenDict,
+    dict: &mut GenDict,
     fuzzable_funcs: &[Function],
     contract_addr: Address,
     seq_len: usize,
@@ -178,7 +178,7 @@ pub fn rand_seq<R: Rng>(
 fn gen_value<R: Rng>(
     rng: &mut R,
     max_value: U256,
-    dict_values: &BTreeSet<U256>,
+    dict_values: &mut CachedSet<U256>,
     func: &Function,
 ) -> U256 {
     let is_payable = matches!(func.state_mutability, alloy_json_abi::StateMutability::Payable);
@@ -197,13 +197,12 @@ fn gen_value<R: Rng>(
     }
 }
 
-fn from_dict_value<R: Rng>(rng: &mut R, dict_values: &BTreeSet<U256>, max: U256) -> U256 {
+fn from_dict_value<R: Rng>(rng: &mut R, dict_values: &mut CachedSet<U256>, max: U256) -> U256 {
     if dict_values.is_empty() {
         return gen_random_value(rng, max);
     }
-    let values: Vec<_> = dict_values.iter().collect();
-    let picked = values[rng.gen_range(0..values.len())];
-    if max.is_zero() { U256::ZERO } else { *picked % (max + U256::from(1)) }
+    let picked = *dict_values.random_pick(rng).unwrap();
+    if max.is_zero() { U256::ZERO } else { picked % (max + U256::from(1)) }
 }
 
 fn gen_random_value<R: Rng>(rng: &mut R, max: U256) -> U256 {
@@ -216,18 +215,17 @@ fn gen_delay<R: Rng>(
     rng: &mut R,
     max_time: u64,
     max_block: u64,
-    dict_values: &BTreeSet<U256>,
+    dict_values: &mut CachedSet<U256>,
 ) -> (u64, u64) {
     let time = gen_single_delay(rng, max_time, dict_values);
     let block = gen_single_delay(rng, max_block, dict_values);
     if time == 0 || block == 0 { (0, 0) } else { (time, block) }
 }
 
-fn gen_single_delay<R: Rng>(rng: &mut R, max: u64, dict_values: &BTreeSet<U256>) -> u64 {
+fn gen_single_delay<R: Rng>(rng: &mut R, max: u64, dict_values: &mut CachedSet<U256>) -> u64 {
     if max == 0 { return 0; }
     if often_usually_bool(rng) && !dict_values.is_empty() {
-        let values: Vec<_> = dict_values.iter().collect();
-        let picked = values[rng.gen_range(0..values.len())];
+        let picked = *dict_values.random_pick(rng).unwrap();
         let as_u64: u64 = picked.try_into().unwrap_or(u64::MAX);
         as_u64 % (max + 1)
     } else {

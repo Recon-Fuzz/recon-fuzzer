@@ -5,7 +5,105 @@ use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_json_abi::{Function, StateMutability};
 use alloy_primitives::{FixedBytes, I256, U256};
 use primitives::{INITIAL_BLOCK_NUMBER, INITIAL_TIMESTAMP};
+use rand::Rng;
 use std::collections::{BTreeSet, HashMap};
+
+/// BTreeSet wrapper with a cached Vec for O(1) random access.
+///
+/// Echidna uses Haskell's `Set.elemAt` for O(log n) random picks.
+/// Rust's BTreeSet lacks indexed access, so `iter().collect()` was used —
+/// O(n) per pick, called millions of times per second. This caches the
+/// Vec and rebuilds only when the set changes.
+#[derive(Debug)]
+pub struct CachedSet<T: Ord + Clone> {
+    set: BTreeSet<T>,
+    cache: Vec<T>,
+    dirty: bool,
+}
+
+impl<T: Ord + Clone> CachedSet<T> {
+    pub fn new() -> Self {
+        Self {
+            set: BTreeSet::new(),
+            cache: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    pub fn insert(&mut self, value: T) -> bool {
+        let inserted = self.set.insert(value);
+        if inserted {
+            self.dirty = true;
+        }
+        inserted
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn iter(&self) -> std::collections::btree_set::Iter<'_, T> {
+        self.set.iter()
+    }
+
+    pub fn contains(&self, value: &T) -> bool {
+        self.set.contains(value)
+    }
+
+    fn rebuild_cache(&mut self) {
+        if self.dirty {
+            self.cache = self.set.iter().cloned().collect();
+            self.dirty = false;
+        }
+    }
+
+    pub fn random_pick<R: Rng>(&mut self, rng: &mut R) -> Option<&T> {
+        if self.set.is_empty() {
+            return None;
+        }
+        self.rebuild_cache();
+        let idx = rng.gen_range(0..self.cache.len());
+        Some(&self.cache[idx])
+    }
+}
+
+impl<T: Ord + Clone> Extend<T> for CachedSet<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        let old_len = self.set.len();
+        self.set.extend(iter);
+        if self.set.len() != old_len {
+            self.dirty = true;
+        }
+    }
+}
+
+impl<T: Ord + Clone> Clone for CachedSet<T> {
+    fn clone(&self) -> Self {
+        Self {
+            set: self.set.clone(),
+            cache: self.set.iter().cloned().collect(),
+            dirty: false,
+        }
+    }
+}
+
+impl<T: Ord + Clone> Default for CachedSet<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a, T: Ord + Clone> IntoIterator for &'a CachedSet<T> {
+    type Item = &'a T;
+    type IntoIter = std::collections::btree_set::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.set.iter()
+    }
+}
 
 /// A Solidity function signature: (name, parameter types)
 pub type SolSignature = (String, Vec<String>);
@@ -37,8 +135,8 @@ pub struct GenDict {
     pub return_types: HashMap<String, DynSolType>,
 
     /// A set of int/uint constants for better performance
-    /// Uses BTreeSet for deterministic iteration order (matches Haskell's Data.Set)
-    pub dict_values: BTreeSet<U256>,
+    /// Uses CachedSet for O(1) random picks (Echidna uses Set.elemAt for O(log n))
+    pub dict_values: CachedSet<U256>,
 
     /// A set of signed int constants
     /// Contains both positive and negative variants for optimization
@@ -73,7 +171,7 @@ impl Default for GenDict {
             whole_calls: HashMap::new(),
             seed: 0,
             return_types: HashMap::new(),
-            dict_values: BTreeSet::new(),
+            dict_values: CachedSet::new(),
             signed_dict_values: BTreeSet::new(),
             callback_sigs: Vec::new(),
             optimization_hot_functions: HashMap::new(),
