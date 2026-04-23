@@ -13,7 +13,7 @@ use crate::worker_env::CorpusEntry;
 /// Mutation constants (c1, c2, c3, c4)
 pub type MutationConsts = (f64, f64, f64, f64);
 
-pub const DEFAULT_MUTATION_CONSTS: MutationConsts = (1.0, 1.0, 1.0, 1.0);
+pub const DEFAULT_MUTATION_CONSTS: MutationConsts = (3.0, 10.0, 3.0, 25.0);
 
 /// Types of transaction list mutations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

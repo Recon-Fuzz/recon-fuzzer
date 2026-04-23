@@ -734,7 +734,7 @@ fn run_fuzz_worker(
         let tx_seq = generate_sequence_worker_cached(
             env,
             &mut rng,
-            &worker.gen_dict,
+            &mut worker.gen_dict,
             &cached_fuzzable,
             &cached_assert_functions,
             &cached_resolved_relations,
