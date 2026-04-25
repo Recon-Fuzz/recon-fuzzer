@@ -129,9 +129,9 @@ impl EvmState {
     /// Returns 0 if no transaction has been executed or if gas info is unavailable
     pub fn get_last_gas_used(&self) -> u64 {
         match &self.last_result {
-            Some(ExecutionResult::Success { gas_used, .. }) => *gas_used,
-            Some(ExecutionResult::Revert { gas_used, .. }) => *gas_used,
-            Some(ExecutionResult::Halt { gas_used, .. }) => *gas_used,
+            Some(ExecutionResult::Success { gas, .. }) => gas.total_gas_spent(),
+            Some(ExecutionResult::Revert { gas, .. }) => gas.total_gas_spent(),
+            Some(ExecutionResult::Halt { gas, .. }) => gas.total_gas_spent(),
             None => 0,
         }
     }

@@ -19,7 +19,7 @@ authors = ["Recon-Fuzzer Contributors"]
 
 [workspace.dependencies]
 # EVM
-revm = { version = "34.0.0", default-features = false, features = ["blst", "c-kzg", "portable", "secp256k1", "std", "serde", "tracer", "optional_balance_check", "optional_block_gas_limit", "optional_eip3607", "optional_no_base_fee"] }
+revm = { version = "38.0.0", default-features = false, features = ["blst", "c-kzg", "portable", "secp256k1", "std", "serde", "tracer", "optional_balance_check", "optional_block_gas_limit", "optional_eip3607", "optional_no_base_fee"] }
 
 # Ethereum primitives
 alloy = { version = "1.7.3", features = ["full"] }

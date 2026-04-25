@@ -163,17 +163,17 @@ impl EvmState {
         let runtime_code = match &execution_result {
             ExecutionResult::Success {
                 output: Output::Call(code),
-                gas_used,
+                gas,
                 ..
             } => {
                 tracing::info!(
                     "Constructor succeeded, gas_used={}, runtime_code_len={}",
-                    gas_used,
+                    gas.total_gas_spent(),
                     code.len()
                 );
                 code.clone()
             }
-            ExecutionResult::Revert { output, gas_used } => {
+            ExecutionResult::Revert { output, gas, .. } => {
                 eprintln!("\n=== Constructor Revert - Running with traces ===");
                 if let Ok(mut traces) = self.deploy_contract_at_with_tracing(
                     deployer,
@@ -185,7 +185,7 @@ impl EvmState {
                 }
                 return Err(ExecError::EvmError(format!(
                     "Constructor reverted: gas_used={}, output=0x{}",
-                    gas_used,
+                    gas.total_gas_spent(),
                     hex::encode(output)
                 )));
             }

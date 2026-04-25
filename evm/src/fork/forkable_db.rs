@@ -252,7 +252,7 @@ impl Database for ForkableDb {
 }
 
 impl DatabaseCommit for ForkableDb {
-    fn commit(&mut self, changes: alloy_primitives::map::HashMap<Address, Account>) {
+    fn commit(&mut self, changes: revm::primitives::AddressMap<Account>) {
         match self {
             ForkableDb::Empty(db) => db.commit(changes),
             ForkableDb::Fork(db) => db.commit(changes),
