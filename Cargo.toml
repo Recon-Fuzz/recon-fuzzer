@@ -23,10 +23,10 @@ revm = { version = "34.0.0", default-features = false, features = ["blst", "c-kz
 
 # Ethereum primitives
 alloy = { version = "1.7.3", features = ["full"] }
-alloy-primitives = { version = "1.5.6", features = ["serde"] }
-alloy-sol-types = "1.5.6"
-alloy-json-abi = "1.5.6"
-alloy-dyn-abi = "1.5.6"
+alloy-primitives = { version = "1.5.7", features = ["serde"] }
+alloy-sol-types = "1.5.7"
+alloy-json-abi = "1.5.7"
+alloy-dyn-abi = "1.5.7"
 
 # Async
 tokio = { version = "1.49", features = ["full"] }
@@ -65,6 +65,7 @@ recon-web = { path = "web-core" }
 # Hex encoding
 hex = "0.4"
 hex-literal = "1.1.0"
+askama = "0.15"
 
 [profile.release]
 lto = "thin"

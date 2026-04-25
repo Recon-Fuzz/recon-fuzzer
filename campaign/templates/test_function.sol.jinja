@@ -1,0 +1,6 @@
+
+    function test_{{ test_name }}() public {
+{%- for stmt in statements %}
+        {{ stmt }}
+{%- endfor %}
+    }

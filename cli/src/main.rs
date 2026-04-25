@@ -173,6 +173,12 @@ struct FuzzArgs {
     #[arg(long)]
     convert: bool,
 
+    /// Path to a CryticToFoundry-style .sol file to append Foundry tests to in real time.
+    /// When a test is solved (shrinking complete), a `function test_…()` is immediately
+    /// appended — no need to wait for the campaign to finish.
+    #[arg(long)]
+    repro: Option<PathBuf>,
+
     /// Compatibility stub: accepted for compatibility with Echidna-style CLIs but has no effect
     #[arg(long, hide = true)]
     #[allow(dead_code)]
@@ -815,6 +821,24 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     let mut env = Env::new(config, project.contracts.clone());
     env.main_contract = Some(main_contract.clone());
     env.slither_info = slither_info;
+
+    // Set up --repro writer if specified
+    if let Some(ref repro_path) = args.repro {
+        let abs_path = if repro_path.is_absolute() {
+            repro_path.clone()
+        } else {
+            args.project.join(repro_path)
+        };
+        if !abs_path.exists() {
+            anyhow::bail!(
+                "--repro file does not exist: {}. Create a CryticToFoundry-style .sol file first.",
+                abs_path.display()
+            );
+        }
+        info!("Foundry repro output: {}", abs_path.display());
+        let abi = env.main_contract.as_ref().map(|c| c.abi.clone());
+        env.repro_writer = Some(campaign::repro::ReproWriter::new(abs_path, abi));
+    }
 
     // Populate view_pure_functions for shrinking optimization
     // These functions don't modify state, so they can be replaced with NoCall during shrinking

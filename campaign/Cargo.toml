@@ -32,3 +32,4 @@ hex.workspace = true
 chrono = "0.4"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+askama.workspace = true

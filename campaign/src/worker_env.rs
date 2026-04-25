@@ -9,6 +9,7 @@ use evm::{coverage::MetadataToCodehash, exec::CoverageMap, foundry::CompiledCont
 use parking_lot::RwLock;
 
 use crate::config::Env;
+use crate::repro::ReproWriter;
 use crate::testing::EchidnaTest;
 use crate::web::WebObservableState;
 use crate::world::World;
@@ -56,6 +57,8 @@ pub struct WorkerEnv {
     pub setup_dict_signed: Vec<I256>,
     /// Dictionary tuples/structs extracted from setUp traces (e.g., MarketParams)
     pub setup_dict_tuples: Vec<alloy_dyn_abi::DynSolValue>,
+    /// Foundry repro writer (--repro flag)
+    pub repro_writer: Option<ReproWriter>,
 }
 
 impl From<&Env> for WorkerEnv {
@@ -84,6 +87,7 @@ impl From<&Env> for WorkerEnv {
             setup_dict_addresses: env.setup_dict_addresses.clone(),
             setup_dict_signed: env.setup_dict_signed.clone(),
             setup_dict_tuples: env.setup_dict_tuples.clone(),
+            repro_writer: env.repro_writer.clone(),
         }
     }
 }
