@@ -11,9 +11,18 @@ use rand::prelude::*;
 use evm::exec::EvmState;
 
 use crate::output;
-use crate::testing::TestState;
+use crate::testing::{EchidnaTest, TestState};
 use crate::types::WorkerState;
 use crate::worker_env::WorkerEnv;
+
+/// Write a Foundry reproducer to the --repro file if configured.
+fn try_write_repro(env: &WorkerEnv, test: &EchidnaTest) {
+    if let Some(ref writer) = env.repro_writer {
+        if let Err(e) = writer.append_test(test) {
+            tracing::error!("Failed to write Foundry repro: {}", e);
+        }
+    }
+}
 
 /// Shrink tests that this worker owns (WorkerEnv variant)
 /// force_stop: If true, skip shrinking and return immediately (second Ctrl+C)
@@ -51,6 +60,7 @@ pub fn shrink_pending_tests_worker(
                 if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                     tracing::error!("Failed to save shrunk reproducer: {}", e);
                 }
+                try_write_repro(env, &test);
                 // Broadcast shrink completion to web UI
                 if let Some(ref web_state) = env.web_state {
                     web_state.broadcast_test_state_change(
@@ -76,6 +86,7 @@ pub fn shrink_pending_tests_worker(
                         {
                             tracing::error!("Failed to save shrunk reproducer: {}", e);
                         }
+                        try_write_repro(env, &shrunk_test);
                     }
                     // Broadcast shrink progress to web UI (every attempt, not just completion)
                     if let Some(ref web_state) = env.web_state {
@@ -264,6 +275,7 @@ pub fn close_and_shrink_optimization_tests(
                     if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                         tracing::error!("Failed to save shrunk reproducer: {}", e);
                     }
+                    try_write_repro(env, &test);
                     // Broadcast shrink completion to web UI
                     if let Some(ref web_state) = env.web_state {
                         web_state.broadcast_test_state_change(
@@ -295,6 +307,7 @@ pub fn close_and_shrink_optimization_tests(
                         {
                             tracing::error!("Failed to save shrunk reproducer: {}", e);
                         }
+                        try_write_repro(env, &shrunk_test);
                     }
                     // Broadcast shrink progress to web UI (every attempt, not just completion)
                     if let Some(ref web_state) = env.web_state {
@@ -338,6 +351,7 @@ pub fn close_and_shrink_optimization_tests(
                 if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                     tracing::error!("Failed to save shrunk reproducer: {}", e);
                 }
+                try_write_repro(env, &test);
                 // Broadcast shrink completion to web UI
                 if let Some(ref web_state) = env.web_state {
                     web_state.broadcast_test_state_change(

@@ -10,8 +10,8 @@ config.workspace = true
 abi.workspace = true
 
 revm = { workspace = true, features = ["std", "serde"] }
-revm-inspector = "15.0"
-revm-inspectors = { version = "0.34", default-features = false, features = ["std"] }
+revm-inspector = "19.0"
+revm-inspectors = { version = "0.39", default-features = false, features = ["std"] }
 alloy.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true

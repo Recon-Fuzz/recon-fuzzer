@@ -624,7 +624,7 @@ impl Database for ForkDb {
 }
 
 impl DatabaseCommit for ForkDb {
-    fn commit(&mut self, changes: alloy_primitives::map::HashMap<Address, Account>) {
+    fn commit(&mut self, changes: revm::primitives::AddressMap<Account>) {
         let mut accounts = self.accounts.write().unwrap();
         let mut storage = self.storage.write().unwrap();
 

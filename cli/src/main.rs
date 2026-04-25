@@ -58,7 +58,7 @@ struct FuzzArgs {
     workers: Option<u8>,
 
     /// Maximum number of test iterations (default: 50000)
-    #[arg(long)]
+    #[arg(long, value_parser = parse_capped_usize)]
     test_limit: Option<usize>,
 
     /// Number of tries to shrink a failing sequence (default: 5000)
@@ -172,6 +172,69 @@ struct FuzzArgs {
     /// Convert-only mode: export recon corpus to Echidna format and exit (requires --recon-corpus-dir)
     #[arg(long)]
     convert: bool,
+
+    /// Path to a CryticToFoundry-style .sol file to append Foundry tests to in real time.
+    /// When a test is solved (shrinking complete), a `function test_…()` is immediately
+    /// appended — no need to wait for the campaign to finish.
+    #[arg(long)]
+    repro: Option<PathBuf>,
+
+    /// Compatibility stub: accepted for compatibility with Echidna-style CLIs but has no effect
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
+    disable_slither: bool,
+}
+
+/// Clap value parser for usize that caps oversized values at usize::MAX
+/// (i.e. u64::MAX on 64-bit targets) instead of erroring on overflow.
+fn parse_capped_usize(s: &str) -> Result<usize, String> {
+    match s.trim().parse::<u128>() {
+        Ok(n) => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Serde deserializer for `Option<usize>` that accepts integers, floats, or
+/// strings that exceed `usize::MAX` and silently caps them at `usize::MAX`,
+/// so configs with very large `testLimit` values don't fail to parse.
+fn deserialize_capped_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Num {
+        Int(i128),
+        Float(f64),
+        Str(String),
+    }
+
+    let opt = Option::<Num>::deserialize(deserializer)?;
+    Ok(opt.map(|v| match v {
+        Num::Int(n) => {
+            if n <= 0 {
+                0
+            } else {
+                usize::try_from(n).unwrap_or(usize::MAX)
+            }
+        }
+        Num::Float(f) => {
+            if !f.is_finite() || f <= 0.0 {
+                0
+            } else if f >= usize::MAX as f64 {
+                usize::MAX
+            } else {
+                f as usize
+            }
+        }
+        Num::Str(s) => s
+            .trim()
+            .parse::<u128>()
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX),
+    }))
 }
 
 /// Parse an address from hex string
@@ -199,7 +262,7 @@ struct FlatConfig {
     contract_addr: Option<String>,
     deployer: Option<String>,
     sender: Option<Vec<String>>,
-    #[serde(rename = "testLimit")]
+    #[serde(rename = "testLimit", default, deserialize_with = "deserialize_capped_usize")]
     test_limit: Option<usize>,
     #[serde(rename = "shrinkLimit")]
     shrink_limit: Option<usize>,
@@ -758,6 +821,24 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     let mut env = Env::new(config, project.contracts.clone());
     env.main_contract = Some(main_contract.clone());
     env.slither_info = slither_info;
+
+    // Set up --repro writer if specified
+    if let Some(ref repro_path) = args.repro {
+        let abs_path = if repro_path.is_absolute() {
+            repro_path.clone()
+        } else {
+            args.project.join(repro_path)
+        };
+        if !abs_path.exists() {
+            anyhow::bail!(
+                "--repro file does not exist: {}. Create a CryticToFoundry-style .sol file first.",
+                abs_path.display()
+            );
+        }
+        info!("Foundry repro output: {}", abs_path.display());
+        let abi = env.main_contract.as_ref().map(|c| c.abi.clone());
+        env.repro_writer = Some(campaign::repro::ReproWriter::new(abs_path, abi));
+    }
 
     // Populate view_pure_functions for shrinking optimization
     // These functions don't modify state, so they can be replaced with NoCall during shrinking

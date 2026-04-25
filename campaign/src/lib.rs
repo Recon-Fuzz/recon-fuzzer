@@ -9,6 +9,7 @@ pub mod export;
 pub mod fork_value_extractor;
 pub mod injection;
 pub mod output;
+pub mod repro;
 pub mod shortcuts;
 pub mod shrink;
 pub mod status;
