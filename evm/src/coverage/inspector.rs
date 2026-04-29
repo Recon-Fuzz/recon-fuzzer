@@ -504,6 +504,9 @@ impl CoverageMode {
 /// A typical transaction touches 1000-10000 opcodes, pre-allocate for common case
 pub const TOUCHED_INITIAL_CAPACITY: usize = 4096;
 
+/// Selector keccak256("Panic(uint256)")[..4] — Solidity 0.8+ Panic revert prefix.
+const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
+
 /// Combined inspector for coverage tracking AND cheatcode handling
 #[derive(Debug, Clone)]
 pub struct CombinedInspector {
@@ -513,6 +516,13 @@ pub struct CombinedInspector {
     /// Incremented in call(), decremented in call_end()
     /// this tracks `length vm.frames`
     pub call_depth: u64,
+    /// Set to true if any sub-call (any depth) reverted with `Panic(0x01)` —
+    /// the encoding solc uses for `assert(false)` in 0.8+. Detection is a
+    /// 4-byte selector + single-byte panic-code compare in `call_end`.
+    pub nested_panic_1: bool,
+    /// Set to true if any sub-call halted with `InvalidFEOpcode` — the older
+    /// encoding for `assert` (0xfe). Detection is one match arm in `call_end`.
+    pub nested_invalid_fe: bool,
     /// Cache of metadata_hash -> compile-time codehash
     /// NOTE: We key by metadata_hash (bytecode identity) not address, because for DELEGATECALL
     /// the same address can execute different bytecode (caller vs library)
@@ -546,6 +556,8 @@ impl CombinedInspector {
         Self {
             touched: Vec::with_capacity(TOUCHED_INITIAL_CAPACITY),
             call_depth: 0, // Start at 0, incremented on first call
+            nested_panic_1: false,
+            nested_invalid_fe: false,
             codehash_cache: HashMap::new(),
             bytecode_ptr_cache: HashMap::new(),
             metadata_to_codehash: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -563,6 +575,8 @@ impl CombinedInspector {
         Self {
             touched: Vec::with_capacity(TOUCHED_INITIAL_CAPACITY),
             call_depth: 0,
+            nested_panic_1: false,
+            nested_invalid_fe: false,
             codehash_cache: HashMap::new(),
             bytecode_ptr_cache: HashMap::new(),
             metadata_to_codehash,
@@ -593,7 +607,7 @@ impl CombinedInspector {
     pub fn set_generate_calls_context(
         &mut self,
         fuzzable_functions: Vec<(alloy_primitives::FixedBytes<4>, String, Vec<alloy_dyn_abi::DynSolType>)>,
-        gen_dict: abi::types::GenDict,
+        gen_dict: std::sync::Arc<abi::types::GenDict>,
         rng_seed: u64,
     ) {
         use crate::cheatcodes::GenerateCallsContext;
@@ -626,6 +640,8 @@ impl CombinedInspector {
         self.created_addresses.clear();
         self.call_depth = 0;
         self.create_codehash_stack.clear();
+        self.nested_panic_1 = false;
+        self.nested_invalid_fe = false;
     }
 }
 
@@ -980,8 +996,30 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedIn
         None
     }
 
-    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, _outcome: &mut CallOutcome) {
-        // Decrement call depth when call returns 
+    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        // Cheap any-depth assertion-failure detection. Both flags are sticky
+        // for the tx — once set they stay set. Cost: at most a 4-byte selector
+        // + 1-byte panic-code compare per CALL frame.
+        use revm::interpreter::InstructionResult;
+        match outcome.result.result {
+            // assert(false) on solc 0.8+ → Revert with Panic(uint256) selector + code 1.
+            InstructionResult::Revert if !self.nested_panic_1 => {
+                let out = &outcome.result.output;
+                if out.len() >= 4 + 32
+                    && out[..4] == PANIC_SELECTOR
+                    && out[4 + 31] == 1
+                {
+                    self.nested_panic_1 = true;
+                }
+            }
+            // Pre-0.8 `assert(false)` compiles to INVALID (0xFE).
+            InstructionResult::InvalidFEOpcode | InstructionResult::OpcodeNotFound => {
+                self.nested_invalid_fe = true;
+            }
+            _ => {}
+        }
+
+        // Decrement call depth when call returns
         if self.call_depth > 0 {
             self.call_depth -= 1;
         }

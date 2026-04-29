@@ -216,19 +216,23 @@ pub fn check_assertion(
     let is_correct_addr = vm.get_last_call_target() == Some(addr);
     let is_correct_target = is_correct_fn && is_correct_addr;
 
-    // Check for invalid opcode (0xfe commonly used for assertions)
-    let is_assertion_failure = matches!(
-        vm.last_result,
-        Some(revm::context_interface::result::ExecutionResult::Halt {
-            reason: revm::context_interface::result::HaltReason::InvalidFEOpcode
-                | revm::context_interface::result::HaltReason::OpcodeNotFound,
-            ..
-        })
-    );
+    // Check for invalid opcode (0xfe commonly used for assertions). Also true
+    // if any *sub-call* halted with INVALID — flag is set in the inspector's
+    // `call_end` so we catch nested cases that the outer `last_result` hides.
+    let is_assertion_failure = vm.last_nested_invalid_fe
+        || matches!(
+            vm.last_result,
+            Some(revm::context_interface::result::ExecutionResult::Halt {
+                reason: revm::context_interface::result::HaltReason::InvalidFEOpcode
+                    | revm::context_interface::result::HaltReason::OpcodeNotFound,
+                ..
+            })
+        );
 
-    // Check for Panic(1) (assert false) in Revert data
-    let panic_1 =
-        if let Some(revm::context_interface::result::ExecutionResult::Revert { output, .. }) =
+    // Check for Panic(1) (assert false) in Revert data — outer frame OR any
+    // sub-call (nested flag captured per-frame in the inspector).
+    let panic_1 = vm.last_nested_panic_1
+        || if let Some(revm::context_interface::result::ExecutionResult::Revert { output, .. }) =
             &vm.last_result
         {
             if output.len() >= 4 + 32 {

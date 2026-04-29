@@ -743,9 +743,12 @@ pub fn execute_sequence_worker_with_checkpoints(
             .collect();
 
         if !fuzzable_funcs.is_empty() {
+            // Snapshot the dict once per sequence into an `Arc` so each tx in
+            // the sequence (and the inspector inside it) shares the same
+            // immutable copy via refcount bump rather than deep-cloning.
             vm.generate_calls_context = Some((
                 fuzzable_funcs,
-                worker.gen_dict.clone(),
+                std::sync::Arc::new(worker.gen_dict.clone()),
                 rand::random::<u64>(),
             ));
         }
@@ -893,9 +896,12 @@ pub fn execute_sequence_worker(
             .collect();
 
         if !fuzzable_funcs.is_empty() {
+            // Snapshot the dict once per sequence into an `Arc` so each tx in
+            // the sequence (and the inspector inside it) shares the same
+            // immutable copy via refcount bump rather than deep-cloning.
             vm.generate_calls_context = Some((
                 fuzzable_funcs,
-                worker.gen_dict.clone(),
+                std::sync::Arc::new(worker.gen_dict.clone()),
                 rand::random::<u64>(), // Random seed for this sequence
             ));
         }

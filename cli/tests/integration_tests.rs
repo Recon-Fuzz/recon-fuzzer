@@ -408,7 +408,8 @@ mod fork_tests {
     fn test_non_fork_state() {
         let vm = EvmState::new();
         assert!(!vm.is_fork());
-        assert!(vm.chain_id().is_none());
+        // Non-fork mode defaults to mainnet (chain id = 1).
+        assert_eq!(vm.chain_id(), 1);
     }
 
     #[test]
@@ -424,9 +425,7 @@ mod fork_tests {
             Ok(vm) => {
                 assert!(vm.is_fork());
                 // Mainnet should have chain_id = 1
-                if let Some(chain_id) = vm.chain_id() {
-                    assert!(chain_id > 0, "Chain ID should be positive");
-                }
+                assert!(vm.chain_id() > 0, "Chain ID should be positive");
             }
             Err(e) => {
                 eprintln!("Fork initialization failed (network may be unavailable): {}", e);
