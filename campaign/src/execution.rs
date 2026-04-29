@@ -725,6 +725,32 @@ pub fn execute_sequence_worker_with_checkpoints(
         })
         .max();
 
+    // Set context for vm.generateCalls() cheatcode (on-demand reentrancy
+    // testing). The cheatcode reads this from `vm.generate_calls_context`
+    // when handlers like `receive()` invoke `vmExt.generateCalls(n)` — without
+    // it, the cheatcode hands back an empty bytes[] and reentrancy patterns
+    // that depend on it become no-ops. See `execute_sequence_worker` for the
+    // mirror of this block (kept in sync intentionally).
+    if let Some(ref contract) = env.main_contract {
+        let fuzzable = contract.fuzzable_functions(true);
+        let fuzzable_funcs: Vec<_> = fuzzable
+            .iter()
+            .map(|f| {
+                let selector = f.selector();
+                let param_types = contract.get_param_types(&selector).to_vec();
+                (selector, f.name.clone(), param_types)
+            })
+            .collect();
+
+        if !fuzzable_funcs.is_empty() {
+            vm.generate_calls_context = Some((
+                fuzzable_funcs,
+                worker.gen_dict.clone(),
+                rand::random::<u64>(),
+            ));
+        }
+    }
+
     for tx in tx_seq {
         let (result, local_cov) =
             vm.exec_tx_check_new_cov(

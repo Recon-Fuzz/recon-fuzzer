@@ -54,6 +54,13 @@ pub struct CompiledContract {
     /// Functions to exclude from fuzzing (e.g., callback handlers like "onCallback")
     /// Contains function names WITHOUT parameters
     pub exclude_from_fuzzing: Vec<String>,
+
+    /// Foundry artifact's top-level `id` field — the file id of this contract's
+    /// own source within the build-info that compiled it. Combined with
+    /// `source_path` it disambiguates which build-info this artifact belongs
+    /// to so source-map file ids can be remapped correctly when multiple
+    /// build-info JSON files coexist (different solc versions / profiles).
+    pub source_file_id: Option<i32>,
 }
 
 impl CompiledContract {
@@ -192,6 +199,11 @@ struct FoundryArtifact {
     #[serde(rename = "deployedBytecode")]
     deployed_bytecode: BytecodeObject,
     metadata: Option<serde_json::Value>,
+    /// Top-level `id` field — local file id of this contract's source within
+    /// its build-info. Used to identify which build-info compiled this artifact
+    /// when multiple build-info files coexist.
+    #[serde(default)]
+    id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,6 +377,7 @@ fn parse_single_artifact(path: &Path, name: &str) -> Result<Option<CompiledContr
         init_source_map: artifact.bytecode.source_map,
         resolved_param_types,
         exclude_from_fuzzing: Vec::new(),
+        source_file_id: artifact.id,
     }))
 }
 

@@ -72,7 +72,7 @@ pub struct CheatcodeState {
     pub etches: HashMap<Address, Bytes>,
     /// Warp timestamp
     pub warp_timestamp: Option<U256>,
-    /// Roll block number  
+    /// Roll block number
     pub roll_block: Option<U256>,
     /// Labels for addresses
     pub labels: HashMap<Address, String>,
@@ -188,7 +188,6 @@ impl CheatcodeInspector {
             calls.len(),
             seed
         );
-
         encode_bytes_array(&calls)
     }
 
@@ -353,7 +352,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                 }
             }
         }
-        
+
         // Reset last_opcode after handling
         self.last_opcode = 0;
     }
@@ -630,4 +629,5 @@ mod tests {
         let selector = warpCall::SELECTOR;
         assert_eq!(selector.len(), 4);
     }
+
 }

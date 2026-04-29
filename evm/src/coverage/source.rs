@@ -2,7 +2,6 @@
 //!
 //! Maps PC-level coverage to source code lines and generates LCOV reports
 
-use alloy_primitives::Address;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -366,9 +365,13 @@ pub fn build_pc_to_index(bytecode: &[u8]) -> HashMap<usize, usize> {
 }
 
 /// Build a map from codehash to ContractSourceInfo for all contracts (deployed bytecode)
-/// This enables coverage mapping for externally-called contracts (like LibraryUser)
+/// This enables coverage mapping for externally-called contracts (like LibraryUser).
+///
+/// `index` is used to remap each contract's source-map file ids from its
+/// build-info-local space into the global space used by `index.source_files`.
 pub fn build_codehash_to_source_info(
     contracts: &[crate::foundry::CompiledContract],
+    index: &SourceInfoIndex,
 ) -> HashMap<alloy_primitives::B256, ContractSourceInfo> {
     use alloy_primitives::keccak256;
 
@@ -388,10 +391,14 @@ pub fn build_codehash_to_source_info(
         // Compute the compile-time codehash
         let codehash = keccak256(&contract.deployed_bytecode);
 
-        // Parse the source map
-        let source_map = SourceMap {
-            locations: parse_source_map(source_map_str),
-        };
+        // Resolve this contract's build-info and remap its source-map file ids
+        // into the global id space.
+        let remap = index.remap_for_contract(&contract.source_path, contract.source_file_id);
+        let mut locations = parse_source_map(source_map_str);
+        for loc in &mut locations {
+            loc.file_id = SourceInfoIndex::apply_remap(remap, loc.file_id);
+        }
+        let source_map = SourceMap { locations };
 
         // Get file ID from first valid source map entry
         let file_id = source_map.locations.iter()
@@ -438,10 +445,14 @@ pub fn build_codehash_to_source_info(
     map
 }
 
-/// Build a map from codehash to ContractSourceInfo for init/constructor code
-/// This enables coverage mapping for constructor execution
+/// Build a map from codehash to ContractSourceInfo for init/constructor code.
+/// This enables coverage mapping for constructor execution.
+///
+/// `index` is used to remap each contract's source-map file ids from its
+/// build-info-local space into the global space used by `index.source_files`.
 pub fn build_init_codehash_to_source_info(
     contracts: &[crate::foundry::CompiledContract],
+    index: &SourceInfoIndex,
 ) -> HashMap<alloy_primitives::B256, ContractSourceInfo> {
     use alloy_primitives::keccak256;
 
@@ -461,10 +472,14 @@ pub fn build_init_codehash_to_source_info(
         // Compute the codehash of init bytecode
         let codehash = keccak256(&contract.bytecode);
 
-        // Parse the source map
-        let source_map = SourceMap {
-            locations: parse_source_map(source_map_str),
-        };
+        // Resolve this contract's build-info and remap its source-map file ids
+        // into the global id space.
+        let remap = index.remap_for_contract(&contract.source_path, contract.source_file_id);
+        let mut locations = parse_source_map(source_map_str);
+        for loc in &mut locations {
+            loc.file_id = SourceInfoIndex::apply_remap(remap, loc.file_id);
+        }
+        let source_map = SourceMap { locations };
 
         // Get file ID from first valid source map entry
         let file_id = source_map.locations.iter()
@@ -516,6 +531,12 @@ pub type CodehashToSourceInfo = HashMap<alloy_primitives::B256, ContractSourceIn
 struct FoundryArtifactFull {
     #[serde(rename = "deployedBytecode")]
     deployed_bytecode: DeployedBytecode,
+    /// Top-level `id` — file id of this artifact's source within its build-info.
+    #[serde(default)]
+    id: Option<i32>,
+    /// Foundry metadata; we read `settings.compilationTarget` to learn the
+    /// artifact's source path independently of the artifact filename.
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,14 +546,22 @@ struct DeployedBytecode {
     source_map: Option<String>,
 }
 
-/// Build info structures
+/// Build-info JSON parsed to extract per-build-info file-id → path mappings.
+/// Supports both the legacy schema (`output.sources[path].id`) and the newer
+/// compact schema (top-level `source_id_to_path`).
 #[derive(Debug, Deserialize)]
-struct BuildInfo {
-    output: BuildOutput,
+struct BuildInfoRaw {
+    /// Newer compact format: { "0": "lib/forge-std/src/Base.sol", ... }
+    #[serde(default)]
+    source_id_to_path: HashMap<String, String>,
+    /// Older format: { "output": { "sources": { "path": { "id": N }, ... } } }
+    #[serde(default)]
+    output: Option<BuildOutput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct BuildOutput {
+    #[serde(default)]
     sources: HashMap<String, SourceInfo>,
 }
 
@@ -541,52 +570,247 @@ struct SourceInfo {
     id: i32,
 }
 
-
-/// Load source coverage data from a Foundry project
-pub fn load_source_info(project_path: &Path) -> Result<(HashMap<i32, SourceFile>, HashMap<Address, ContractSourceInfo>)> {
-    let out_dir = project_path.join("out");
-
-    // First, load the build-info to get file ID mappings
-    let build_info_dir = out_dir.join("build-info");
-    let mut file_id_to_path: HashMap<i32, PathBuf> = HashMap::new();
-
-    if build_info_dir.exists() {
-        for entry in fs::read_dir(&build_info_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(build_info) = serde_json::from_str::<BuildInfo>(&content) {
-                        for (source_path, info) in build_info.output.sources {
-                            file_id_to_path.insert(info.id, PathBuf::from(&source_path));
-                        }
-                    }
+impl BuildInfoRaw {
+    /// Return this build-info's local file id → source path mapping, merging
+    /// both schema forms. The newer compact form takes precedence when both
+    /// are present.
+    fn local_id_to_path(&self) -> HashMap<i32, PathBuf> {
+        let mut out: HashMap<i32, PathBuf> = HashMap::new();
+        if !self.source_id_to_path.is_empty() {
+            for (k, v) in &self.source_id_to_path {
+                if let Ok(id) = k.parse::<i32>() {
+                    out.insert(id, PathBuf::from(v));
                 }
             }
+            return out;
         }
-    }
-
-    // Load source files
-    let mut source_files: HashMap<i32, SourceFile> = HashMap::new();
-    for (file_id, rel_path) in &file_id_to_path {
-        let full_path = project_path.join(rel_path);
-        if full_path.exists() {
-            if let Ok(content) = fs::read_to_string(&full_path) {
-                source_files.insert(*file_id, SourceFile::new(full_path, content));
+        if let Some(output) = &self.output {
+            for (path, info) in &output.sources {
+                out.insert(info.id, PathBuf::from(path));
             }
         }
+        out
     }
-
-    // Contract info will be populated when we know the deployed addresses
-    let contracts: HashMap<Address, ContractSourceInfo> = HashMap::new();
-
-    Ok((source_files, contracts))
 }
 
-/// Load contract source info from artifact
+/// Index built from all `out/build-info/*.json` files.
+///
+/// Foundry can leave multiple build-info JSONs in `out/build-info/` (incremental
+/// builds, multiple compile profiles, different solc versions). Each build-info
+/// has its OWN file-id space — the same numeric id can refer to different
+/// source paths across build-infos. The naive "merge into one map" loses data
+/// silently and produces wrong coverage reports.
+///
+/// This index keeps each build-info's file-id space separate, assigns global
+/// ids on top, and lets callers ask "which build-info produced this artifact?"
+/// so source-map file ids can be remapped through the right one.
+#[derive(Debug, Default, Clone)]
+pub struct SourceInfoIndex {
+    /// Source files keyed by GLOBAL file id (one id per unique source path).
+    pub source_files: HashMap<i32, SourceFile>,
+    /// Path → global file id (inverse of source_files keys).
+    path_to_global: HashMap<PathBuf, i32>,
+    /// Per-build-info remap: build_info_hash → (local_id → global_id).
+    build_info_remaps: HashMap<String, HashMap<i32, i32>>,
+    /// (source_path, local_file_id) → build_info_hash.
+    /// Lets us identify which build-info compiled an artifact via its top-level
+    /// `id` field combined with its source path.
+    contract_to_build_info: HashMap<(PathBuf, i32), String>,
+    /// source_path → list of build_info_hashes that contain this source.
+    /// Fallback when a contract artifact has no `id` field — we pick any
+    /// build-info that contains its source path.
+    path_to_build_infos: HashMap<PathBuf, Vec<String>>,
+}
+
+impl SourceInfoIndex {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Look up the local→global remap for the build-info that compiled this
+    /// contract. The key is `(contract.source_path, contract.source_file_id)`;
+    /// when `source_file_id` is None we fall back to any build-info that
+    /// contains the source path.
+    pub fn remap_for_contract(
+        &self,
+        source_path: &Path,
+        local_file_id: Option<i32>,
+    ) -> Option<&HashMap<i32, i32>> {
+        if let Some(fid) = local_file_id {
+            let key = (source_path.to_path_buf(), fid);
+            if let Some(hash) = self.contract_to_build_info.get(&key) {
+                return self.build_info_remaps.get(hash);
+            }
+        }
+        // Fallback: pick the first build-info that contains this source path.
+        let hashes = self.path_to_build_infos.get(source_path)?;
+        let hash = hashes.first()?;
+        self.build_info_remaps.get(hash)
+    }
+
+    /// Apply a (possibly absent) remap to a single source-map file id.
+    /// Negative ids (sentinel for "no source") pass through; ids that the
+    /// remap can't translate become -1 so downstream code skips them.
+    pub fn apply_remap(remap: Option<&HashMap<i32, i32>>, local_id: i32) -> i32 {
+        if local_id < 0 {
+            return local_id;
+        }
+        match remap {
+            Some(m) => m.get(&local_id).copied().unwrap_or(-1),
+            None => local_id, // No remap available — keep id as-is (legacy behaviour).
+        }
+    }
+}
+
+/// Time window (seconds) used to discard stale build-info files. Foundry can
+/// leave old build-info JSONs in `out/build-info/` from previous compiles
+/// (different solc versions, scrapped profiles). We treat the most recent
+/// build-info's mtime as the reference and ignore anything older than this
+/// window — those stale files would otherwise contribute file ids that no
+/// current artifact references, polluting the global remap.
+const BUILD_INFO_FRESH_WINDOW_SECS: u64 = 30;
+
+/// Load source coverage data from a Foundry project.
+///
+/// Reads every recent `out/build-info/*.json` independently, assigns
+/// globally-unique file ids by source path, and records a per-build-info
+/// `local_id → global_id` remap. Source maps in contract artifacts use ids
+/// local to their build-info, so callers must remap them via
+/// [`SourceInfoIndex::remap_for_contract`] before indexing into `source_files`.
+///
+/// Build-info files are filtered to those whose mtime is within
+/// [`BUILD_INFO_FRESH_WINDOW_SECS`] of the newest one — this drops stale
+/// build-info JSONs from older compiles that no current artifact references.
+pub fn load_source_info(project_path: &Path) -> Result<SourceInfoIndex> {
+    let out_dir = project_path.join("out");
+    let build_info_dir = out_dir.join("build-info");
+
+    let mut index = SourceInfoIndex::empty();
+
+    if !build_info_dir.exists() {
+        return Ok(index);
+    }
+
+    let mut next_global: i32 = 0;
+
+    // Collect (path, mtime) for every build-info JSON.
+    let mut paths_with_mtime: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(&build_info_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |e| e == "json"))
+        .filter_map(|p| {
+            let mtime = fs::metadata(&p).and_then(|m| m.modified()).ok()?;
+            Some((p, mtime))
+        })
+        .collect();
+
+    // Drop stale build-info files: keep only those within
+    // BUILD_INFO_FRESH_WINDOW_SECS of the newest mtime.
+    if let Some(newest) = paths_with_mtime.iter().map(|(_, t)| *t).max() {
+        let window = std::time::Duration::from_secs(BUILD_INFO_FRESH_WINDOW_SECS);
+        let total_before = paths_with_mtime.len();
+        paths_with_mtime.retain(|(_, t)| match newest.duration_since(*t) {
+            Ok(age) => age <= window,
+            // mtime is in the future relative to "newest" — keep it.
+            Err(_) => true,
+        });
+        let dropped = total_before - paths_with_mtime.len();
+        if dropped > 0 {
+            tracing::debug!(
+                "load_source_info: dropping {} stale build-info file(s) (older than {}s from newest)",
+                dropped,
+                BUILD_INFO_FRESH_WINDOW_SECS
+            );
+        }
+    }
+
+    // Iterate fresh build-info files in sorted order so global-id assignment
+    // is stable across runs.
+    let mut entries: Vec<PathBuf> = paths_with_mtime.into_iter().map(|(p, _)| p).collect();
+    entries.sort();
+
+    for path in entries {
+        let bi_hash = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let bi: BuildInfoRaw = match serde_json::from_str(&content) {
+            Ok(bi) => bi,
+            Err(e) => {
+                tracing::debug!("Skipping build-info {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        let local_to_path = bi.local_id_to_path();
+        if local_to_path.is_empty() {
+            continue;
+        }
+
+        let mut remap: HashMap<i32, i32> = HashMap::with_capacity(local_to_path.len());
+
+        for (local_id, src_path) in &local_to_path {
+            // Assign or reuse a global id for this source path.
+            let global_id = match index.path_to_global.get(src_path) {
+                Some(&g) => g,
+                None => {
+                    let g = next_global;
+                    next_global += 1;
+                    index.path_to_global.insert(src_path.clone(), g);
+                    // Eagerly load the source file content.
+                    let full_path = if src_path.is_absolute() {
+                        src_path.clone()
+                    } else {
+                        project_path.join(src_path)
+                    };
+                    if full_path.exists() {
+                        if let Ok(content) = fs::read_to_string(&full_path) {
+                            index
+                                .source_files
+                                .insert(g, SourceFile::new(full_path, content));
+                        }
+                    }
+                    g
+                }
+            };
+            remap.insert(*local_id, global_id);
+            index
+                .contract_to_build_info
+                .insert((src_path.clone(), *local_id), bi_hash.clone());
+            index
+                .path_to_build_infos
+                .entry(src_path.clone())
+                .or_default()
+                .push(bi_hash.clone());
+        }
+
+        index.build_info_remaps.insert(bi_hash, remap);
+    }
+
+    tracing::debug!(
+        "load_source_info: {} source files across {} build-infos ({} unique paths)",
+        index.source_files.len(),
+        index.build_info_remaps.len(),
+        index.path_to_global.len()
+    );
+
+    Ok(index)
+}
+
+/// Load contract source info from a Foundry artifact, remapping the artifact's
+/// source-map file ids into the global id space tracked by `index`.
+///
+/// `index` is required because the source map's file ids are local to the
+/// build-info that compiled the artifact; the artifact's own source path and
+/// top-level `id` field are used to identify that build-info.
 pub fn load_contract_source_info(
     project_path: &Path,
     contract_name: &str,
+    index: &SourceInfoIndex,
 ) -> Result<Option<(ContractSourceInfo, i32)>> {
     let out_dir = project_path.join("out");
 
@@ -615,12 +839,23 @@ pub fn load_contract_source_info(
                     artifact.deployed_bytecode.object.trim_start_matches("0x")
                 ).unwrap_or_default();
 
-                // Parse source map
-                let source_map = SourceMap {
-                    locations: parse_source_map(source_map_str),
-                };
+                // Resolve the build-info that compiled this artifact and apply
+                // its file-id remap. `compilationTarget` (when present) gives
+                // us the source path independently of the artifact path.
+                let source_path = artifact_source_path(&artifact)
+                    .unwrap_or_else(|| path.parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| PathBuf::from(n.to_string_lossy().to_string()))
+                        .unwrap_or_default());
 
-                // Get file ID from the source map's first valid entry
+                let remap = index.remap_for_contract(&source_path, artifact.id);
+                let mut locations = parse_source_map(source_map_str);
+                for loc in &mut locations {
+                    loc.file_id = SourceInfoIndex::apply_remap(remap, loc.file_id);
+                }
+                let source_map = SourceMap { locations };
+
+                // Get file ID from the (now-remapped) source map's first valid entry
                 let file_id = source_map.locations.iter()
                     .find(|loc| loc.file_id >= 0)
                     .map(|loc| loc.file_id)
@@ -640,6 +875,28 @@ pub fn load_contract_source_info(
     }
 
     Ok(None)
+}
+
+/// Extract the source path for a Foundry artifact from its
+/// `metadata.settings.compilationTarget` (preferred — exact path used by
+/// solc) or, failing that, the first key in `metadata.sources`.
+fn artifact_source_path(artifact: &FoundryArtifactFull) -> Option<PathBuf> {
+    let md = artifact.metadata.as_ref()?;
+    if let Some(ct) = md
+        .get("settings")
+        .and_then(|s| s.get("compilationTarget"))
+        .and_then(|c| c.as_object())
+    {
+        if let Some(k) = ct.keys().next() {
+            return Some(PathBuf::from(k));
+        }
+    }
+    if let Some(sources) = md.get("sources").and_then(|s| s.as_object()) {
+        if let Some(k) = sources.keys().next() {
+            return Some(PathBuf::from(k));
+        }
+    }
+    None
 }
 
 /// Generate source coverage from PC coverage (single contract - legacy)
@@ -2061,5 +2318,110 @@ mod tests {
 
         assert_eq!(mapping.get(&0), Some(&0)); // PUSH1 at PC 0 is index 0
         assert_eq!(mapping.get(&2), Some(&1)); // STOP at PC 2 is index 1
+    }
+
+    /// Two build-info JSONs reuse the same numeric file id (5) for *different*
+    /// source paths. The naive merge would overwrite — this test pins down
+    /// that the new index keeps each build-info's id space separate, assigns
+    /// distinct global ids, and remap_for_contract returns the right map.
+    #[test]
+    fn test_load_source_info_multi_build_info_id_collision() {
+        let tmp = tempdir_unique();
+        let project = tmp.join("proj");
+        let bi_dir = project.join("out").join("build-info");
+        fs::create_dir_all(&bi_dir).unwrap();
+
+        // Two real source files with different content so we can verify which
+        // SourceFile got loaded for each global id.
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/A.sol"), "// A\n").unwrap();
+        fs::write(project.join("src/B.sol"), "// B\n").unwrap();
+
+        // Build-info "aaaa" assigns id=5 → src/A.sol
+        let bi_a = serde_json::json!({
+            "source_id_to_path": { "5": "src/A.sol" }
+        });
+        fs::write(bi_dir.join("aaaa.json"), bi_a.to_string()).unwrap();
+        // Build-info "bbbb" assigns id=5 → src/B.sol  (collides!)
+        let bi_b = serde_json::json!({
+            "source_id_to_path": { "5": "src/B.sol" }
+        });
+        fs::write(bi_dir.join("bbbb.json"), bi_b.to_string()).unwrap();
+
+        let index = load_source_info(&project).expect("load_source_info");
+
+        // Each path must have its own global id.
+        let g_a = index.path_to_global.get(&PathBuf::from("src/A.sol")).copied();
+        let g_b = index.path_to_global.get(&PathBuf::from("src/B.sol")).copied();
+        assert!(g_a.is_some() && g_b.is_some());
+        assert_ne!(g_a, g_b, "distinct paths must have distinct global ids");
+
+        // Both source files must be loaded under their global ids.
+        let sa = index.source_files.get(&g_a.unwrap()).unwrap();
+        let sb = index.source_files.get(&g_b.unwrap()).unwrap();
+        assert!(sa.content.contains("// A"));
+        assert!(sb.content.contains("// B"));
+
+        // remap_for_contract must pick the right build-info per (path, local_id).
+        let remap_a = index
+            .remap_for_contract(&PathBuf::from("src/A.sol"), Some(5))
+            .expect("A remap");
+        assert_eq!(remap_a.get(&5).copied(), g_a, "A's local id 5 -> A's global id");
+
+        let remap_b = index
+            .remap_for_contract(&PathBuf::from("src/B.sol"), Some(5))
+            .expect("B remap");
+        assert_eq!(remap_b.get(&5).copied(), g_b, "B's local id 5 -> B's global id");
+    }
+
+    /// A stale build-info file older than BUILD_INFO_FRESH_WINDOW_SECS must be
+    /// ignored — it would otherwise contribute file ids that no current
+    /// artifact references, polluting the global remap.
+    #[test]
+    fn test_load_source_info_drops_stale_build_info() {
+        let tmp = tempdir_unique();
+        let project = tmp.join("proj");
+        let bi_dir = project.join("out").join("build-info");
+        fs::create_dir_all(&bi_dir).unwrap();
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/Fresh.sol"), "// fresh\n").unwrap();
+        fs::write(project.join("src/Stale.sol"), "// stale\n").unwrap();
+
+        let fresh = serde_json::json!({
+            "source_id_to_path": { "0": "src/Fresh.sol" }
+        });
+        let stale = serde_json::json!({
+            "source_id_to_path": { "0": "src/Stale.sol" }
+        });
+        fs::write(bi_dir.join("fresh.json"), fresh.to_string()).unwrap();
+        fs::write(bi_dir.join("stale.json"), stale.to_string()).unwrap();
+
+        // Backdate the stale file far enough to fall outside the freshness window.
+        let stale_path = bi_dir.join("stale.json");
+        let old = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(BUILD_INFO_FRESH_WINDOW_SECS + 60);
+        let old_ft = filetime::FileTime::from_system_time(old);
+        filetime::set_file_mtime(&stale_path, old_ft).unwrap();
+
+        let index = load_source_info(&project).expect("load_source_info");
+        assert!(index.path_to_global.contains_key(&PathBuf::from("src/Fresh.sol")));
+        assert!(
+            !index.path_to_global.contains_key(&PathBuf::from("src/Stale.sol")),
+            "stale build-info should have been dropped"
+        );
+    }
+
+    /// Helper: create a unique temp directory.
+    fn tempdir_unique() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("recon_src_test_{}_{}", nanos, n));
+        fs::create_dir_all(&p).unwrap();
+        p
     }
 }

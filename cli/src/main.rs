@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 use alloy_primitives::{Address, U256};
 use evm::{
     exec::EvmState,
-    foundry::{deploy_with_linking, find_contract, FoundryProject},
+    foundry::{deploy_with_linking_and_value, find_contract, FoundryProject},
 };
 // use campaign::{run_campaign, EConfig, Env, corpus::load_corpus};
 
@@ -237,6 +237,30 @@ where
     }))
 }
 
+/// Deserializer for echidna-compatible U256 fields. Reads the yaml scalar as a
+/// string (yaml is happy to hand out any scalar as a string regardless of its
+/// implicit type) and then parses to U256, accepting either decimal or `0x...`
+/// hex.
+fn deserialize_u256_opt<'de, D>(deserializer: D) -> Result<Option<U256>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    let Some(s) = s else { return Ok(None) };
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let parsed = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        U256::from_str_radix(hex, 16)
+    } else {
+        U256::from_str_radix(t, 10)
+    };
+    parsed
+        .map(Some)
+        .map_err(|e| serde::de::Error::custom(format!("invalid U256 value {:?}: {}", t, e)))
+}
+
 /// Parse an address from hex string
 fn parse_address(s: &str) -> Result<Address> {
     let s = s.strip_prefix("0x").unwrap_or(s);
@@ -281,6 +305,12 @@ struct FlatConfig {
     all_contracts: Option<bool>,
     #[serde(rename = "mutableOnly")]
     mutable_only: Option<bool>,
+    /// Echidna-compatible: initial ETH balance funded into deployer/senders.
+    #[serde(rename = "balanceAddr", default, deserialize_with = "deserialize_u256_opt")]
+    balance_addr: Option<U256>,
+    /// Echidna-compatible: initial ETH balance of the deployed test contract.
+    #[serde(rename = "balanceContract", default, deserialize_with = "deserialize_u256_opt")]
+    balance_contract: Option<U256>,
     // Performance
     #[serde(rename = "lcovEnable")]
     lcov_enable: Option<bool>,
@@ -480,6 +510,12 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         }
         if let Some(mutable) = flat.mutable_only {
             config.sol_conf.mutable_only = mutable;
+        }
+        if let Some(bal) = flat.balance_addr {
+            config.sol_conf.balance_addr = Some(bal);
+        }
+        if let Some(bal) = flat.balance_contract {
+            config.sol_conf.balance_contract = bal;
         }
 
         // Note: coverage option from config is parsed but coverage is always enabled
@@ -891,6 +927,20 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                     fork_vm.chain_id(),
                     fork_vm.db.rpc_call_count()
                 );
+                // Prefer the corpus-dir-scoped RPC cache (echidna format,
+                // checked into the project). The default chain-scoped cache
+                // was already loaded inside ForkableDb::new_fork.
+                if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
+                    match fork_vm.load_fork_cache_from_dir(corpus_dir) {
+                        Ok(true) => info!("Loaded RPC cache from corpus dir {:?}", corpus_dir),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(
+                            "Failed to load RPC cache from corpus dir {:?}: {}",
+                            corpus_dir,
+                            e
+                        ),
+                    }
+                }
                 fork_vm
             }
             Err(e) => {
@@ -908,12 +958,17 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         &env.cfg.campaign_conf.coverage_mode,
     ));
 
-    // Fund deployer and senders with max balance to avoid funding issues
+    // Fund deployer and senders. If `balanceAddr` is set in config, honor it
+    // exactly (echidna semantics, default 0xffffffff). Otherwise fund with
+    // U256::MAX/2 to avoid funding issues during long campaigns.
     let deployer = env.cfg.sol_conf.deployer;
     let _contract_addr = env.cfg.sol_conf.contract_addr;
 
-    // Use U256::MAX / 2 to allow for some accumulation without overflow if receiving
-    let funding = U256::MAX / U256::from(2);
+    let funding = env
+        .cfg
+        .sol_conf
+        .balance_addr
+        .unwrap_or_else(|| U256::MAX / U256::from(2));
 
     vm.fund_account(deployer, funding);
     for sender in &env.cfg.sol_conf.sender {
@@ -962,15 +1017,25 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         println!("Contract has no constructor (or empty constructor)");
     }
 
-    // Deploy with automatic library linking
-    // Pass init coverage ref to track constructor coverage (init bytecode, not runtime)
-    // Returns traces from constructor execution for dictionary extraction
-    let (deployed_addr, constructor_traces) = deploy_with_linking(
+    // Deploy with automatic library linking. The constructor msg.value is the
+    // configured `balanceContract` (echidna semantics), so `address(this).balance`
+    // and any payable constructor logic see the intended starting funds.
+    // Pass init coverage ref to track constructor coverage (init bytecode, not runtime).
+    // Returns traces from constructor execution for dictionary extraction.
+    let balance_contract = env.cfg.sol_conf.balance_contract;
+    if balance_contract > U256::ZERO {
+        info!(
+            "Sending balanceContract={} wei as msg.value to constructor",
+            balance_contract
+        );
+    }
+    let (deployed_addr, constructor_traces) = deploy_with_linking_and_value(
         &mut vm,
         &mut project,
         &main_contract.name,
         deployer,
         target_addr,
+        balance_contract,
         &env.coverage_ref_init,
         &env.codehash_map,
     )?;
@@ -1015,18 +1080,25 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         // Run setUp with tracing to capture created contracts
         match vm.exec_tx_with_revm_tracing(&setup_tx) {
             Ok((_result, traces, _storage_changes, _storage_reads, _output, _logs, pcs)) => {
-                // Merge setUp coverage into init coverage map (captures constructor coverage)
-                // PCs from setUp include both init code (CREATE/CREATE2) and runtime calls
-                // The codehash-based lookup will correctly attribute coverage
+                // Merge setUp coverage into BOTH init and runtime coverage maps.
+                // setUp typically only CALLs already-deployed contracts, so PCs carry
+                // *runtime* codehashes (keccak256 of deployed bytecode). But setUp may
+                // also CREATE new contracts, producing PCs with *init* codehashes.
+                // Each report-generation pass uses its own codehash-keyed lookup
+                // (runtime_source_info vs init_source_info), so writing to both maps
+                // does not double-count: a given codehash matches only one of them.
                 if !pcs.is_empty() {
                     let mut init_cov = env.coverage_ref_init.write();
+                    let mut runtime_cov = env.coverage_ref_runtime.write();
                     for (codehash, pc) in &pcs {
-                        let contract_cov = init_cov.entry(*codehash).or_default();
-                        let entry = contract_cov.entry(*pc).or_insert((0, 0));
-                        entry.0 |= 1; // Mark as covered at depth 0
-                        entry.1 |= 1; // Mark as successful execution
+                        for cov in [&mut *init_cov, &mut *runtime_cov] {
+                            let contract_cov = cov.entry(*codehash).or_default();
+                            let entry = contract_cov.entry(*pc).or_insert((0, 0));
+                            entry.0 |= 1; // Mark as covered at depth 0
+                            entry.1 |= 1; // Mark as successful execution
+                        }
                     }
-                    info!("setUp coverage: {} PCs tracked", pcs.len());
+                    info!("setUp coverage: {} PCs tracked (recorded in init + runtime maps)", pcs.len());
                 }
 
                 // Extract vm.label() calls from setUp
@@ -1428,14 +1500,60 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         }
     }
 
-    // Save fork cache if in fork mode (persists RPC data for future runs)
+    // Save fork cache if in fork mode (persists RPC data for future runs).
+    // Always save to the chain-scoped default location, and additionally to
+    // the corpus dir when one is configured (echidna-compatible layout, so
+    // the cache file can be checked into the project).
     if initial_vm.is_fork() {
         match initial_vm.save_fork_cache() {
-            Ok(()) => {
-                info!("Saved fork cache to disk for future runs");
+            Ok(()) => info!("Saved fork cache to disk for future runs"),
+            Err(e) => tracing::warn!("Failed to save fork cache: {}", e),
+        }
+        if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
+            match initial_vm.save_fork_cache_to_dir(corpus_dir) {
+                Ok(()) => info!("Saved RPC cache to corpus dir {:?}", corpus_dir),
+                Err(e) => tracing::warn!(
+                    "Failed to save RPC cache to corpus dir {:?}: {}",
+                    corpus_dir,
+                    e
+                ),
             }
-            Err(e) => {
-                tracing::warn!("Failed to save fork cache: {}", e);
+        }
+
+        // Per-address on-chain coverage (mirrors echidna's
+        // `Onchain.saveCoverageReport`): for every contract whose code the
+        // fork pulled from RPC, fetch verified source from Sourcify (then
+        // Etherscan if `ETHERSCAN_API_KEY` is set) and write
+        // `<corpus>/<addr>/covered.<unix_ts>.{html,lcov}`.
+        if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
+            let chain_id = initial_vm.chain_id().unwrap_or(1);
+            let contracts = initial_vm.fork_contracts_with_code();
+            // Filter out the deployed test contract — its source is local.
+            let test_addr = env.cfg.sol_conf.contract_addr;
+            let contracts: Vec<_> = contracts
+                .into_iter()
+                .filter(|(addr, _)| *addr != test_addr)
+                .collect();
+            if !contracts.is_empty() {
+                info!(
+                    "Generating on-chain coverage reports for {} addresses…",
+                    contracts.len()
+                );
+                let runtime_cov = env.coverage_ref_runtime.read().clone();
+                let reports = evm::coverage::onchain::save_onchain_coverage_reports(
+                    chain_id,
+                    &contracts,
+                    &runtime_cov,
+                    corpus_dir,
+                );
+                for r in &reports {
+                    println!(
+                        "On-chain coverage [{} {}]: {}",
+                        r.address.to_checksum(None),
+                        r.contract_name,
+                        r.html_path.display()
+                    );
+                }
             }
         }
     }
@@ -1779,7 +1897,7 @@ fn run_shrink_mode(
     Ok(())
 }
 
-/// Pretty-print a call sequence (Echidna format)
+/// Pretty-print a call sequence (Echidna format).
 fn print_call_sequence(txs: &[evm::types::Tx], contract_name: &str) {
     if txs.is_empty() {
         println!("  (no transactions)");
@@ -1805,22 +1923,23 @@ fn generate_coverage_reports(
         generate_source_coverage_multi, load_source_info, save_html_report, save_lcov_report,
     };
 
-    // Load source file information
-    let (source_files, _) = load_source_info(project_path)?;
+    // Load source file information (per-build-info file-id remap is built here).
+    let source_index = load_source_info(project_path)?;
+    let source_files = &source_index.source_files;
 
-    // Build codehash -> source info maps for runtime and init code
-    // Runtime uses deployed bytecode source maps, init uses constructor source maps
-    let runtime_source_info = build_codehash_to_source_info(contracts);
-    let init_source_info = build_init_codehash_to_source_info(contracts);
+    // Build codehash -> source info maps for runtime and init code.
+    // Runtime uses deployed bytecode source maps, init uses constructor source maps.
+    let runtime_source_info = build_codehash_to_source_info(contracts, &source_index);
+    let init_source_info = build_init_codehash_to_source_info(contracts, &source_index);
 
     // Generate source-level coverage separately for init and runtime
     // Init code has different source maps than runtime code
     let mut source_coverage =
-        generate_source_coverage_multi(runtime_coverage, &runtime_source_info, &source_files);
+        generate_source_coverage_multi(runtime_coverage, &runtime_source_info, source_files);
 
     // Generate init code coverage and merge
     let init_source_coverage =
-        generate_source_coverage_multi(init_coverage, &init_source_info, &source_files);
+        generate_source_coverage_multi(init_coverage, &init_source_info, source_files);
 
     // Merge init coverage into runtime coverage
     for (path, init_file_cov) in init_source_coverage.files {
@@ -1837,7 +1956,7 @@ fn generate_coverage_reports(
     let lcov_path = save_lcov_report(&source_coverage, project_path, corpus_dir)?;
 
     // Save HTML report (Echidna-style with hit counts)
-    let html_path = save_html_report(&source_coverage, project_path, corpus_dir, &source_files)?;
+    let html_path = save_html_report(&source_coverage, project_path, corpus_dir, source_files)?;
 
     Ok((lcov_path, html_path))
 }

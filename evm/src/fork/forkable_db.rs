@@ -74,13 +74,15 @@ impl ForkableDb {
         // Get resolved block number for cache key
         let block_num = fork_db.block_number().unwrap_or(0);
 
-        // Try to load existing cache
+        // Try to load existing cache from the chain-scoped default location.
+        // (Callers can also load from an explicit corpus dir via
+        // `load_cache_from_dir` after construction.)
         let chain_cache_dir = cache_path.join(format!("chain_{}", chain_id));
         if let Some(cache) = ForkDb::load_cache(&chain_cache_dir, block_num) {
             tracing::info!(
-                "Loaded fork cache: {} accounts, {} slots",
-                cache.accounts.len(),
-                cache.storage.len()
+                "Loaded fork cache: {} contracts, {} slots",
+                cache.contracts.len(),
+                cache.slots.len()
             );
             fork_db.load_cache_data(&cache);
         } else {
@@ -119,8 +121,8 @@ impl ForkableDb {
         }
     }
 
-    /// Save cache to default location automatically organized by chain_id and block
-    /// Cache is saved to: `{default_cache_dir}/chain_{chain_id}/rpc_cache_{block}.json`
+    /// Save cache to the default chain-scoped location.
+    /// File: `{default_cache_dir}/chain_{chain_id}/rpc-cache-{block}.json`
     pub fn save_to_default_cache(&self) -> Result<(), ForkError> {
         match self {
             ForkableDb::Empty(_) => Ok(()), // No-op for empty db
@@ -129,6 +131,43 @@ impl ForkableDb {
                 let block = db.db.block_number().unwrap_or(0);
                 let cache_dir = default_cache_dir().join(format!("chain_{}", chain_id));
                 db.db.save_cache(&cache_dir, block)
+            }
+        }
+    }
+
+    /// Snapshot external contracts (`(address, bytecode)`) that the fork has
+    /// observed during this run. Empty-code accounts (EOAs) are skipped.
+    /// Returns an empty vec for non-fork databases.
+    pub fn cached_contracts_with_code(&self) -> Vec<(Address, alloy_primitives::Bytes)> {
+        match self {
+            ForkableDb::Empty(_) => Vec::new(),
+            ForkableDb::Fork(db) => db.db.cached_contracts_with_code(),
+        }
+    }
+
+    /// Load any pre-existing `rpc-cache-<block>.json` from a user-supplied
+    /// directory (e.g. the project's corpus dir) into this fork's caches.
+    /// No-op for non-fork databases or when the file isn't present.
+    pub fn load_cache_from_dir(&self, dir: &Path) -> Result<bool, ForkError> {
+        match self {
+            ForkableDb::Empty(_) => Ok(false),
+            ForkableDb::Fork(db) => {
+                let block = match db.db.block_number() {
+                    Some(b) => b,
+                    None => return Ok(false),
+                };
+                if let Some(cache) = ForkDb::load_cache(dir, block) {
+                    tracing::info!(
+                        "Loaded fork cache from {:?}: {} contracts, {} slots",
+                        dir,
+                        cache.contracts.len(),
+                        cache.slots.len()
+                    );
+                    db.db.load_cache_data(&cache);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
         }
     }
