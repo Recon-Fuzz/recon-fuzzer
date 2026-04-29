@@ -437,7 +437,7 @@ pub fn write_traces(
         if !fuzzable_funcs.is_empty() {
             // Use a fixed seed for reproducible trace replay (different from original)
             // Note: This means reentrancy calls in traces may differ from actual execution
-            let gen_dict = abi::types::GenDict::new(0xDEADBEEF);
+            let gen_dict = std::sync::Arc::new(abi::types::GenDict::new(0xDEADBEEF));
             vm.generate_calls_context = Some((fuzzable_funcs, gen_dict, 0x12345678));
         }
     }

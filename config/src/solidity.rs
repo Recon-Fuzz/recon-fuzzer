@@ -86,6 +86,13 @@ pub struct SolConf {
     /// Mirrors echidna's `balanceContract` (default 0). Sent as msg.value
     /// during the constructor call, so `address(this).balance` reflects it.
     pub balance_contract: U256,
+
+    /// Default chain id for the EVM. Mirrors echidna's `chainId` knob.
+    /// `None` means: use 1 (mainnet) in non-fork mode, or the fork's actual
+    /// chain id in fork mode. Setting it forces every tx to run with this
+    /// chain id (overrides the fork value). Can also be changed at runtime
+    /// via `vm.chainId(uint256)`.
+    pub chain_id: Option<u64>,
 }
 
 impl Default for SolConf {
@@ -110,6 +117,7 @@ impl Default for SolConf {
             mutable_only: false,
             balance_addr: None,
             balance_contract: U256::ZERO,
+            chain_id: None,
         }
     }
 }

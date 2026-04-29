@@ -394,6 +394,16 @@ pub fn build_codehash_to_source_info(
         // Resolve this contract's build-info and remap its source-map file ids
         // into the global id space.
         let remap = index.remap_for_contract(&contract.source_path, contract.source_file_id);
+        if remap.is_none() {
+            tracing::warn!(
+                "no build-info match for contract {} (source_path={}, source_file_id={:?}); \
+                 coverage for this contract will be misattributed — \
+                 try `forge clean && forge build --build-info`",
+                contract.name,
+                contract.source_path.display(),
+                contract.source_file_id
+            );
+        }
         let mut locations = parse_source_map(source_map_str);
         for loc in &mut locations {
             loc.file_id = SourceInfoIndex::apply_remap(remap, loc.file_id);

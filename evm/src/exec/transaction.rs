@@ -54,6 +54,7 @@ impl EvmState {
         let gas_limit = self.gas_limit;
         let block_number = self.block_number;
         let timestamp = self.timestamp;
+        let chain_id = self.chain_id;
 
         // Step 1: Create an account at target_addr with the init code as its "runtime" code
         // This is a hack - we temporarily set the init code as the contract's code
@@ -90,6 +91,7 @@ impl EvmState {
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {
+                cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = Some(usize::MAX);
                 cfg.limit_contract_initcode_size = Some(usize::MAX);
                 cfg.disable_balance_check = true;
@@ -106,6 +108,7 @@ impl EvmState {
                 tx_env.gas_limit = gas_limit;
                 tx_env.nonce = nonce;
                 tx_env.gas_price = 0;
+                tx_env.chain_id = Some(chain_id);
             })
             .modify_block_chained(|block| {
                 block.number = U256::from(block_number);
@@ -132,12 +135,15 @@ impl EvmState {
         // Commit state changes from constructor
         self.db.commit(result_and_state.state);
 
-        // Persist vm.warp/vm.roll effects (Foundry parity)
+        // Persist vm.warp/vm.roll/vm.chainId effects (Foundry parity)
         if let Some(warped) = cheatcode_inspector.state.warp_timestamp {
             self.timestamp = warped.saturating_to();
         }
         if let Some(rolled) = cheatcode_inspector.state.roll_block {
             self.block_number = rolled.saturating_to();
+        }
+        if let Some(new_id) = cheatcode_inspector.state.chain_id {
+            self.chain_id = new_id.saturating_to();
         }
 
         // Extract labels from cheatcode inspector and store in vm state
@@ -227,6 +233,7 @@ impl EvmState {
         let gas_limit = self.gas_limit;
         let block_number = self.block_number;
         let timestamp = self.timestamp;
+        let chain_id = self.chain_id;
 
         // Set up the target account with init code (already done in main deploy)
         let init_bytecode = Bytecode::new_raw(bytecode);
@@ -251,6 +258,7 @@ impl EvmState {
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {
+                cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = Some(usize::MAX);
                 cfg.limit_contract_initcode_size = Some(usize::MAX);
                 cfg.disable_balance_check = true;
@@ -267,6 +275,7 @@ impl EvmState {
                 tx_env.gas_limit = gas_limit;
                 tx_env.nonce = nonce;
                 tx_env.gas_price = 0;
+                tx_env.chain_id = Some(chain_id);
             })
             .modify_block_chained(|block| {
                 block.number = U256::from(block_number);
@@ -379,6 +388,7 @@ impl EvmState {
         let nonce = self.get_nonce(tx.src);
         let block_number = U256::from(self.block_number);
         let block_timestamp = U256::from(self.timestamp);
+        let chain_id = self.chain_id;
         let caller = tx.src;
         let value = tx.value;
         let gas_limit = tx.gas;
@@ -390,6 +400,7 @@ impl EvmState {
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {
+                cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = Some(usize::MAX); // Unlimited contract size
                 cfg.limit_contract_initcode_size = Some(usize::MAX); // Unlimited init code size
                 cfg.disable_balance_check = true;
@@ -406,6 +417,7 @@ impl EvmState {
                 tx_env.gas_limit = gas_limit;
                 tx_env.nonce = nonce;
                 tx_env.gas_price = tx.gasprice.saturating_to();
+                tx_env.chain_id = Some(chain_id);
             })
             .modify_block_chained(|block| {
                 block.number = block_number;
@@ -448,6 +460,9 @@ impl EvmState {
             }
             if let Some(rolled) = inspector.state.roll_block {
                 self.block_number = rolled.saturating_to();
+            }
+            if let Some(new_id) = inspector.state.chain_id {
+                self.chain_id = new_id.saturating_to();
             }
 
             self.last_result = Some(execution_result);
@@ -502,6 +517,7 @@ impl EvmState {
         let nonce = self.get_nonce(tx.src);
         let block_number = U256::from(self.block_number);
         let block_timestamp = U256::from(self.timestamp);
+        let chain_id = self.chain_id;
         let caller = tx.src;
         let value = tx.value;
         let gas_limit = tx.gas;
@@ -533,6 +549,7 @@ impl EvmState {
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {
+                cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = Some(usize::MAX); // Unlimited contract size
                 cfg.limit_contract_initcode_size = Some(usize::MAX); // Unlimited init code size
                 cfg.disable_balance_check = true;
@@ -549,6 +566,7 @@ impl EvmState {
                 tx_env.gas_limit = gas_limit;
                 tx_env.nonce = nonce;
                 tx_env.gas_price = tx.gasprice.saturating_to();
+                tx_env.chain_id = Some(chain_id);
             })
             .modify_block_chained(|block| {
                 block.number = block_number;
@@ -596,6 +614,9 @@ impl EvmState {
             }
             if let Some(rolled) = inspector.cheatcode_state().roll_block {
                 self.block_number = rolled.saturating_to();
+            }
+            if let Some(new_id) = inspector.cheatcode_state().chain_id {
+                self.chain_id = new_id.saturating_to();
             }
 
             self.last_result = Some(execution_result);
@@ -673,6 +694,7 @@ impl EvmState {
         let nonce = self.get_nonce(tx.src);
         let block_number = U256::from(self.block_number);
         let block_timestamp = U256::from(self.timestamp);
+        let chain_id = self.chain_id;
         let caller = tx.src;
         let value = tx.value;
         let gas_limit = tx.gas;
@@ -693,6 +715,7 @@ impl EvmState {
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {
+                cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = Some(usize::MAX); // Unlimited contract size
                 cfg.limit_contract_initcode_size = Some(usize::MAX); // Unlimited init code size
                 cfg.disable_balance_check = true;
@@ -709,6 +732,7 @@ impl EvmState {
                 tx_env.gas_limit = gas_limit;
                 tx_env.nonce = nonce;
                 tx_env.gas_price = tx.gasprice.saturating_to();
+                tx_env.chain_id = Some(chain_id);
             })
             .modify_block_chained(|block| {
                 block.number = block_number;
@@ -726,6 +750,11 @@ impl EvmState {
 
         // Capture created addresses from inspector (for dictionary enrichment)
         self.last_created_addresses = inspector.created_addresses.clone();
+
+        // Propagate any-depth assertion-failure flags from the inspector.
+        // Detected cheaply per CALL frame in `Inspector::call_end`.
+        self.last_nested_panic_1 = inspector.nested_panic_1;
+        self.last_nested_invalid_fe = inspector.nested_invalid_fe;
 
         let execution_result = result_and_state.result;
         let tx_result = classify_execution_result(&execution_result);
@@ -777,6 +806,9 @@ impl EvmState {
             }
             if let Some(rolled) = inspector.cheatcode_state().roll_block {
                 self.block_number = rolled.saturating_to();
+            }
+            if let Some(new_id) = inspector.cheatcode_state().chain_id {
+                self.chain_id = new_id.saturating_to();
             }
 
             self.last_result = Some(execution_result);
@@ -906,6 +938,7 @@ impl EvmState {
         let nonce = self.get_nonce(tx.src);
         let block_number = U256::from(self.block_number);
         let block_timestamp = U256::from(self.timestamp);
+        let chain_id = self.chain_id;
         let caller = tx.src;
         let value = tx.value;
         let gas_limit = tx.gas;
@@ -917,6 +950,7 @@ impl EvmState {
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {
+                cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = Some(usize::MAX);
                 cfg.limit_contract_initcode_size = Some(usize::MAX);
                 cfg.disable_balance_check = true;
@@ -933,6 +967,7 @@ impl EvmState {
                 tx_env.gas_limit = gas_limit;
                 tx_env.nonce = nonce;
                 tx_env.gas_price = tx.gasprice.saturating_to();
+                tx_env.chain_id = Some(chain_id);
             })
             .modify_block_chained(|block| {
                 block.number = block_number;
@@ -996,6 +1031,9 @@ impl EvmState {
             }
             if let Some(rolled) = inspector.cheatcode_state().roll_block {
                 self.block_number = rolled.saturating_to();
+            }
+            if let Some(new_id) = inspector.cheatcode_state().chain_id {
+                self.chain_id = new_id.saturating_to();
             }
 
             self.last_result = Some(execution_result);
@@ -1115,6 +1153,7 @@ impl EvmState {
         let nonce = self.get_nonce(tx.src);
         let block_number = U256::from(self.block_number);
         let block_timestamp = U256::from(self.timestamp);
+        let chain_id = self.chain_id;
         let caller = tx.src;
         let value = tx.value;
         let gas_limit = tx.gas;
@@ -1142,6 +1181,7 @@ impl EvmState {
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {
+                cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = Some(usize::MAX);
                 cfg.limit_contract_initcode_size = Some(usize::MAX);
                 cfg.disable_balance_check = true;
@@ -1158,6 +1198,7 @@ impl EvmState {
                 tx_env.gas_limit = gas_limit;
                 tx_env.nonce = nonce;
                 tx_env.gas_price = tx.gasprice.saturating_to();
+                tx_env.chain_id = Some(chain_id);
             })
             .modify_block_chained(|block| {
                 block.number = block_number;
@@ -1223,6 +1264,9 @@ impl EvmState {
             }
             if let Some(rolled) = inspector.cheatcode.state.roll_block {
                 self.block_number = rolled.saturating_to();
+            }
+            if let Some(new_id) = inspector.cheatcode.state.chain_id {
+                self.chain_id = new_id.saturating_to();
             }
 
             self.last_result = Some(execution_result);

@@ -58,6 +58,10 @@ pub struct EvmState {
     /// Current timestamp
     pub timestamp: u64,
 
+    /// Active chain id. Defaults to 1 (mainnet); seeded from the fork in fork
+    /// mode and overridable via `vm.chainId(uint256)` or `chainId` config.
+    pub chain_id: u64,
+
     /// Gas limit for transactions
     pub gas_limit: u64,
 
@@ -89,12 +93,23 @@ pub struct EvmState {
     /// Branch mode only tracks JUMPI/JUMPDEST for faster execution
     pub coverage_mode: crate::coverage::CoverageMode,
 
+    /// Set if the last tx (any frame, including reverted sub-calls) hit
+    /// `Panic(0x01)` — solc 0.8+'s encoding of `assert(false)`. Populated
+    /// from the inspector's nested-detection flag after tx execution.
+    pub last_nested_panic_1: bool,
+    /// Set if the last tx hit the legacy INVALID (0xfe) opcode at any depth.
+    pub last_nested_invalid_fe: bool,
+
     /// Context for vm.generateCalls() cheatcode (on-demand generation)
-    /// Set by campaign layer before tx execution to enable reentrancy testing
-    /// Contains: (fuzzable_functions, gen_dict, rng_seed)
+    /// Set by campaign layer before tx execution to enable reentrancy testing.
+    /// Contains: (fuzzable_functions, gen_dict, rng_seed). `gen_dict` is `Arc`
+    /// so wiring it into per-tx inspector setup is a refcount bump rather than
+    /// a deep clone — the dict can hold thousands of entries that grow over the
+    /// run, and cloning it on every tx accounted for ~70% of fuzzing throughput
+    /// drop in v0.4.10.
     pub generate_calls_context: Option<(
         Vec<(alloy_primitives::FixedBytes<4>, String, Vec<alloy_dyn_abi::DynSolType>)>,
-        abi::types::GenDict,
+        std::sync::Arc<abi::types::GenDict>,
         u64,
     )>,
 }
@@ -111,6 +126,7 @@ impl EvmState {
             db: ForkableDb::new_empty(),
             block_number: INITIAL_BLOCK_NUMBER,
             timestamp: INITIAL_TIMESTAMP,
+            chain_id: 1,
             gas_limit: 1_000_000_000_000, // High gas limit (1T) but not u64::MAX to avoid overflow
             last_result: None,
             last_calldata: Bytes::new(),
@@ -120,6 +136,8 @@ impl EvmState {
             labels: HashMap::new(),
             last_touched_pcs: std::collections::HashSet::new(),
             coverage_mode: crate::coverage::CoverageMode::Full,
+            last_nested_panic_1: false,
+            last_nested_invalid_fe: false,
             generate_calls_context: None,
         };
 
@@ -165,11 +183,13 @@ impl EvmState {
         // Use the actual fork block number and timestamp if available, otherwise use defaults
         let fork_block = db.fork_block_number().unwrap_or(INITIAL_BLOCK_NUMBER);
         let fork_timestamp = db.fork_block_timestamp().unwrap_or(INITIAL_TIMESTAMP);
+        let fork_chain_id = db.chain_id().unwrap_or(1);
 
         let mut state = Self {
             db,
             block_number: fork_block,
             timestamp: fork_timestamp,
+            chain_id: fork_chain_id,
             gas_limit: 1_000_000_000_000,
             last_result: None,
             last_calldata: Bytes::new(),
@@ -179,6 +199,8 @@ impl EvmState {
             labels: HashMap::new(),
             last_touched_pcs: std::collections::HashSet::new(),
             coverage_mode: crate::coverage::CoverageMode::Full,
+            last_nested_panic_1: false,
+            last_nested_invalid_fe: false,
             generate_calls_context: None,
         };
 
@@ -235,9 +257,10 @@ impl EvmState {
         self.db.is_fork()
     }
 
-    /// Get chain ID (only available in fork mode)
-    pub fn chain_id(&self) -> Option<u64> {
-        self.db.chain_id()
+    /// Get the active chain id. Defaults to 1 (mainnet); seeded from the fork
+    /// in fork mode and overridable via `vm.chainId()` or `chainId` config.
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
     }
 
     /// Get the fork block number (only available in fork mode)

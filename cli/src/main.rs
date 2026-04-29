@@ -311,6 +311,10 @@ struct FlatConfig {
     /// Echidna-compatible: initial ETH balance of the deployed test contract.
     #[serde(rename = "balanceContract", default, deserialize_with = "deserialize_u256_opt")]
     balance_contract: Option<U256>,
+    /// Echidna-compatible: chain id used by the EVM. If unset, defaults to 1
+    /// (mainnet) in non-fork mode and to the fork's chain id in fork mode.
+    #[serde(rename = "chainId")]
+    chain_id: Option<u64>,
     // Performance
     #[serde(rename = "lcovEnable")]
     lcov_enable: Option<bool>,
@@ -516,6 +520,9 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         }
         if let Some(bal) = flat.balance_contract {
             config.sol_conf.balance_contract = bal;
+        }
+        if let Some(cid) = flat.chain_id {
+            config.sol_conf.chain_id = Some(cid);
         }
 
         // Note: coverage option from config is parsed but coverage is always enabled
@@ -923,7 +930,7 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         match EvmState::new_fork(rpc_url, env.cfg.rpc_block, evm::fork::ForkOptions::default()) {
             Ok(fork_vm) => {
                 info!(
-                    "Fork initialized: chain_id={:?}, rpc_calls={}",
+                    "Fork initialized: chain_id={}, rpc_calls={}",
                     fork_vm.chain_id(),
                     fork_vm.db.rpc_call_count()
                 );
@@ -957,6 +964,13 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     vm.set_coverage_mode(evm::coverage::CoverageMode::from_str(
         &env.cfg.campaign_conf.coverage_mode,
     ));
+
+    // Apply `chainId` from config if set (overrides the fork's chain id /
+    // mainnet default). Mirrors echidna's `chainId` knob; can also be
+    // changed at runtime via `vm.chainId(uint256)`.
+    if let Some(cid) = env.cfg.sol_conf.chain_id {
+        vm.chain_id = cid;
+    }
 
     // Fund deployer and senders. If `balanceAddr` is set in config, honor it
     // exactly (echidna semantics, default 0xffffffff). Otherwise fund with
@@ -1526,7 +1540,7 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         // Etherscan if `ETHERSCAN_API_KEY` is set) and write
         // `<corpus>/<addr>/covered.<unix_ts>.{html,lcov}`.
         if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
-            let chain_id = initial_vm.chain_id().unwrap_or(1);
+            let chain_id = initial_vm.chain_id();
             let contracts = initial_vm.fork_contracts_with_code();
             // Filter out the deployed test contract — its source is local.
             let test_addr = env.cfg.sol_conf.contract_addr;

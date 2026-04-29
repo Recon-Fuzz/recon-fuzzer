@@ -21,6 +21,7 @@ pub use primitives::HEVM_ADDRESS;
 sol! {
     function warp(uint256 newTimestamp) external;
     function roll(uint256 newNumber) external;
+    function chainId(uint256 newChainId) external;
     function assume(bool condition) external;
     function deal(address who, uint256 newBalance) external;
     function prank(address msgSender) external;
@@ -38,13 +39,19 @@ sol! {
 }
 
 /// Context for generating calls via vm.generateCalls()
-/// Set before tx execution by the campaign layer
+/// Set before tx execution by the campaign layer.
+///
+/// `gen_dict` is wrapped in `Arc` so propagating the context through the
+/// per-sequence and per-tx wiring is a refcount bump instead of a deep
+/// clone of the entire dictionary (which holds large `whole_calls` /
+/// `dict_values` collections that grow over the lifetime of the run).
 #[derive(Debug, Clone)]
 pub struct GenerateCallsContext {
     /// Fuzzable function metadata: (selector, name, param_types)
     pub fuzzable_functions: Vec<(alloy_primitives::FixedBytes<4>, String, Vec<alloy_dyn_abi::DynSolType>)>,
-    /// Generation dictionary (same as main fuzzer)
-    pub gen_dict: abi::types::GenDict,
+    /// Generation dictionary (same as main fuzzer). Read-only at runtime —
+    /// the cheatcode never mutates it, so sharing via `Arc` is safe.
+    pub gen_dict: std::sync::Arc<abi::types::GenDict>,
     /// RNG seed for reproducibility
     pub rng_seed: u64,
     /// Call counter for incrementing seed
@@ -74,6 +81,8 @@ pub struct CheatcodeState {
     pub warp_timestamp: Option<U256>,
     /// Roll block number
     pub roll_block: Option<U256>,
+    /// Chain id override (vm.chainId)
+    pub chain_id: Option<U256>,
     /// Labels for addresses
     pub labels: HashMap<Address, String>,
     /// Whether assume failed (skip this tx)
@@ -124,6 +133,8 @@ pub struct CheatcodeInspector {
 const OP_TIMESTAMP: u8 = 0x42;
 /// NUMBER opcode (0x43) - returns block.number
 const OP_NUMBER: u8 = 0x43;
+/// CHAINID opcode (0x46) - returns chain id (EIP-1344)
+const OP_CHAINID: u8 = 0x46;
 
 impl CheatcodeInspector {
     pub fn new() -> Self {
@@ -211,6 +222,14 @@ impl CheatcodeInspector {
         if selector == rollCall::SELECTOR {
             if let Ok(decoded) = rollCall::abi_decode(input) {
                 self.state.roll_block = Some(decoded.newNumber);
+                return Some(Bytes::new());
+            }
+        }
+
+        // chainId(uint256)
+        if selector == chainIdCall::SELECTOR {
+            if let Ok(decoded) = chainIdCall::abi_decode(input) {
+                self.state.chain_id = Some(decoded.newChainId);
                 return Some(Bytes::new());
             }
         }
@@ -349,6 +368,16 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                 if interp.stack.pop().is_some() {
                     let _ = interp.stack.push(rolled);
                     tracing::trace!("Roll: Overrode NUMBER with {:?}", rolled);
+                }
+            }
+        }
+
+        // Handle vm.chainId() — override CHAINID opcode result (EIP-1344).
+        if self.last_opcode == OP_CHAINID {
+            if let Some(new_id) = self.state.chain_id {
+                if interp.stack.pop().is_some() {
+                    let _ = interp.stack.push(new_id);
+                    tracing::trace!("ChainId: Overrode CHAINID with {:?}", new_id);
                 }
             }
         }
