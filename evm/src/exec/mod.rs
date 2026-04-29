@@ -207,6 +207,29 @@ impl EvmState {
         self.db.save_to_default_cache()
     }
 
+    /// Save the fork's RPC cache as `rpc-cache-<block>.json` directly inside
+    /// `dir` (echidna-compatible layout). Use this to persist the cache into
+    /// the project's corpus dir alongside reproducers.
+    pub fn save_fork_cache_to_dir(&self, dir: &std::path::Path) -> Result<(), ForkError> {
+        let block = match self.db.fork_block_number() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        self.db.save_rpc_cache(dir, block)
+    }
+
+    /// Load `rpc-cache-<block>.json` from `dir` into this fork (no-op if the
+    /// file isn't there or this isn't a fork).
+    pub fn load_fork_cache_from_dir(&self, dir: &std::path::Path) -> Result<bool, ForkError> {
+        self.db.load_cache_from_dir(dir)
+    }
+
+    /// Snapshot the addresses + runtime bytecodes the fork fetched from RPC
+    /// during this run (skipping EOAs / empty-code accounts).
+    pub fn fork_contracts_with_code(&self) -> Vec<(alloy_primitives::Address, alloy_primitives::Bytes)> {
+        self.db.cached_contracts_with_code()
+    }
+
     /// Check if this EVM state is forked from RPC
     pub fn is_fork(&self) -> bool {
         self.db.is_fork()

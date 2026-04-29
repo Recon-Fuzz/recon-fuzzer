@@ -4,6 +4,7 @@
 //! Contains inspectors for runtime coverage collection during EVM execution.
 
 mod inspector;
+pub mod onchain;
 mod source;
 
 // Re-export all public items from inspector
@@ -18,6 +19,6 @@ pub use source::{
     build_codehash_to_source_info, build_init_codehash_to_source_info, build_pc_to_index,
     generate_source_coverage, generate_source_coverage_covered_only, generate_source_coverage_multi,
     load_contract_source_info, load_source_info, parse_source_map, save_html_report, save_lcov_report,
-    CodehashToSourceInfo, ContractSourceInfo, FileCoverage, SourceCoverage, SourceFile, SourceMap,
-    SrcLocation,
+    CodehashToSourceInfo, ContractSourceInfo, FileCoverage, SourceCoverage, SourceFile,
+    SourceInfoIndex, SourceMap, SrcLocation,
 };

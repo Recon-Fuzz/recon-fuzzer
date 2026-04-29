@@ -2,7 +2,7 @@
 //!
 //! Configuration for contract deployment and testing.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
 /// Test mode for the fuzzer
@@ -76,6 +76,16 @@ pub struct SolConf {
 
     /// Only fuzz state-mutating functions (exclude pure/view)
     pub mutable_only: bool,
+
+    /// Initial ETH balance funded into deployer and each sender address.
+    /// Mirrors echidna's `balanceAddr` (default 0xffffffff = ~4.29e9 wei).
+    /// When None, recon's existing default funding (U256::MAX/2) is used.
+    pub balance_addr: Option<U256>,
+
+    /// Initial ETH balance of the deployed test contract.
+    /// Mirrors echidna's `balanceContract` (default 0). Sent as msg.value
+    /// during the constructor call, so `address(this).balance` reflects it.
+    pub balance_contract: U256,
 }
 
 impl Default for SolConf {
@@ -98,6 +108,8 @@ impl Default for SolConf {
             test_mode: TestMode::Property,
             all_contracts: false,
             mutable_only: false,
+            balance_addr: None,
+            balance_contract: U256::ZERO,
         }
     }
 }

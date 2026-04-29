@@ -214,19 +214,22 @@ impl WebObservableState {
         // Load forge config to get src/test folder paths
         let forge_config = load_forge_config();
 
+        // Load source files by ID for line coverage. The index also carries the
+        // per-build-info file-id remap that codehash_to_source_info needs to
+        // produce correct mappings when multiple build-info JSONs coexist.
+        let project_path = std::env::current_dir().unwrap_or_default();
+        let source_index = evm::coverage::load_source_info(&project_path)
+            .unwrap_or_else(|_| evm::coverage::SourceInfoIndex::empty());
+        let source_files_by_id = source_index.source_files.clone();
+
         // Build codehash-to-source-info map for line coverage computation
         // Includes both runtime bytecode and init/constructor bytecode (for CREATE/CREATE2 coverage)
-        let mut codehash_to_source_info = evm::coverage::build_codehash_to_source_info(&env.contracts);
-        let init_codehash_to_source_info = evm::coverage::build_init_codehash_to_source_info(&env.contracts);
+        let mut codehash_to_source_info =
+            evm::coverage::build_codehash_to_source_info(&env.contracts, &source_index);
+        let init_codehash_to_source_info =
+            evm::coverage::build_init_codehash_to_source_info(&env.contracts, &source_index);
         // Merge init code mappings into the main map (different codehashes, so no conflicts)
         codehash_to_source_info.extend(init_codehash_to_source_info);
-
-        // Load source files by ID for line coverage
-        let project_path = std::env::current_dir().unwrap_or_default();
-        let source_files_by_id = match evm::coverage::load_source_info(&project_path) {
-            Ok((files, _)) => files,
-            Err(_) => HashMap::new(),
-        };
 
         // Initialize worker stats
         // Workers 0..num_fuzzing_workers are fuzzing workers
@@ -438,7 +441,7 @@ impl WebObservableState {
 
         // Try to load source info using evm's coverage utilities
         match evm::coverage::load_source_info(&project_path) {
-            Ok((source_map, _)) => source_map
+            Ok(index) => index.source_files
                 .into_iter()
                 .map(|(_file_id, evm_source)| {
                     // Make path relative to project root for consistency with line coverage

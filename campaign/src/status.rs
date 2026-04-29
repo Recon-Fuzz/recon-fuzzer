@@ -63,18 +63,20 @@ pub fn write_lcov_info_worker(env: &WorkerEnv) {
         generate_source_coverage_multi, load_source_info,
     };
 
-    // Load source files (this is cached internally, so reasonably fast)
-    let (source_files, _) = match load_source_info(&env.project_path) {
+    // Load source files (this is cached internally, so reasonably fast).
+    // The index also carries the per-build-info file-id remap.
+    let source_index = match load_source_info(&env.project_path) {
         Ok(info) => info,
         Err(e) => {
             tracing::warn!("Failed to load source info for lcov: {}", e);
             return;
         }
     };
+    let source_files = &source_index.source_files;
 
     // Build codehash -> source info maps for runtime and init code
-    let runtime_source_info = build_codehash_to_source_info(&env.contracts);
-    let init_source_info = build_init_codehash_to_source_info(&env.contracts);
+    let runtime_source_info = build_codehash_to_source_info(&env.contracts, &source_index);
+    let init_source_info = build_init_codehash_to_source_info(&env.contracts, &source_index);
 
     // Get separate coverage for init (constructor) and runtime
     let init_cov = env.coverage_ref_init.read();
@@ -85,14 +87,14 @@ pub fn write_lcov_info_worker(env: &WorkerEnv) {
     let mut source_coverage = generate_source_coverage_multi(
         &runtime_cov,
         &runtime_source_info,
-        &source_files,
+        source_files,
     );
 
     // Generate init code coverage and merge
     let init_source_coverage = generate_source_coverage_multi(
         &init_cov,
         &init_source_info,
-        &source_files,
+        source_files,
     );
 
     // Merge init coverage into runtime coverage

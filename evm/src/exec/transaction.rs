@@ -519,6 +519,17 @@ impl EvmState {
         let mut inspector = crate::coverage::CombinedInspector::new();
         inspector.set_coverage_mode(self.coverage_mode);
 
+        // Wire `generate_calls_context` from the VM into the inspector so
+        // `vm.generateCalls(...)` has the fuzzable-function table and seed
+        // it needs to produce non-empty calldatas.
+        if let Some((fuzzable_funcs, gen_dict, rng_seed)) = &self.generate_calls_context {
+            inspector.set_generate_calls_context(
+                fuzzable_funcs.clone(),
+                gen_dict.clone(),
+                *rng_seed,
+            );
+        }
+
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
             .modify_cfg_chained(|cfg| {

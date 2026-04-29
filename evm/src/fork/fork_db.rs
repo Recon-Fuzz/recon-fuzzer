@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::runtime::Runtime;
 
-use super::cache::{CachedAccount, CachedSlot, RpcCacheData};
+use super::cache::{cache_file_name, CachedAccount, CachedSlot, RpcCacheData};
 use super::error::ForkError;
 use super::rate_limiter::RateLimiter;
 
@@ -167,15 +167,22 @@ impl ForkDb {
 
     /// Load cache data into this ForkDb instance (without creating a new RPC connection)
     pub fn load_cache_data(&self, cache: &RpcCacheData) {
-        // Load cached accounts
+        // Load cached contracts
         {
             let mut accounts = self.accounts.write().unwrap();
-            for (addr, cached) in &cache.accounts {
-                let code = cached.code.clone().map(|b| Bytecode::new_raw(b));
+            for (addr, cached) in &cache.contracts {
+                let code_bytes = cached.code.0.clone();
+                let (code_hash, code) = if code_bytes.is_empty() {
+                    (alloy_primitives::KECCAK256_EMPTY, None)
+                } else {
+                    let bc = Bytecode::new_raw(code_bytes);
+                    (bc.hash_slow(), Some(bc))
+                };
+                let nonce = u64::try_from(cached.nonce).unwrap_or(u64::MAX);
                 let info = AccountInfo {
                     balance: cached.balance,
-                    nonce: cached.nonce,
-                    code_hash: cached.code_hash,
+                    nonce,
+                    code_hash,
                     code,
                     account_id: Default::default(),
                 };
@@ -183,10 +190,10 @@ impl ForkDb {
             }
         }
 
-        // Load cached storage
+        // Load cached storage slots
         {
             let mut storage = self.storage.write().unwrap();
-            for slot in &cache.storage {
+            for slot in &cache.slots {
                 storage.insert((slot.address, slot.slot), slot.value);
             }
         }
@@ -219,6 +226,22 @@ impl ForkDb {
     /// Get total RPC calls made
     pub fn rpc_call_count(&self) -> usize {
         self.rate_limiter.total_calls()
+    }
+
+    /// Snapshot the fork's cached external contracts as `(address, bytecode)`
+    /// pairs. Empty-bytecode entries (EOAs and contracts where the RPC
+    /// returned no code) are skipped — only contracts with usable bytecode
+    /// are returned, since downstream consumers (source fetching, coverage)
+    /// need bytecode to do anything useful.
+    pub fn cached_contracts_with_code(&self) -> Vec<(Address, alloy_primitives::Bytes)> {
+        let accounts = self.accounts.read().unwrap();
+        accounts
+            .iter()
+            .filter_map(|(addr, info)| match &info.code {
+                Some(bc) if !bc.is_empty() => Some((*addr, bc.original_bytes())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Get cache statistics
@@ -472,41 +495,49 @@ impl ForkDb {
         ))
     }
 
-    /// Save cache to disk
+    /// Save cache to disk in the echidna/hevm-compatible
+    /// `rpc-cache-<block>.json` format.
     pub fn save_cache(&self, cache_dir: &Path, block: u64) -> Result<(), ForkError> {
         std::fs::create_dir_all(cache_dir)
             .map_err(|e| ForkError::Cache(format!("create dir: {}", e)))?;
 
-        let cache_file = cache_dir.join(format!("rpc_cache_{}.json", block));
+        let cache_file = cache_dir.join(cache_file_name(block));
 
-        let mut cache = RpcCacheData::new(block, self.chain_id);
+        let mut cache = RpcCacheData::new();
 
-        // Save accounts
+        // Save contracts (skip empty/uninitialized accounts so the file isn't
+        // polluted by transient lookups like address(0)).
         {
             let accounts = self.accounts.read().unwrap();
             for (addr, info) in accounts.iter() {
-                cache.accounts.insert(
+                let code = info
+                    .code
+                    .as_ref()
+                    .map(|c| c.original_bytes())
+                    .unwrap_or_default();
+                cache.contracts.insert(
                     *addr,
                     CachedAccount {
+                        code: code.into(),
+                        nonce: U256::from(info.nonce),
                         balance: info.balance,
-                        nonce: info.nonce,
-                        code_hash: info.code_hash,
-                        code: info.code.as_ref().map(|c| c.original_bytes()),
                     },
                 );
             }
         }
 
-        // Save storage
+        // Save storage slots
         {
             let storage = self.storage.read().unwrap();
             for ((addr, slot), value) in storage.iter() {
-                cache.storage.push(CachedSlot {
+                cache.slots.push(CachedSlot {
                     address: *addr,
                     slot: *slot,
                     value: *value,
                 });
             }
+            // Stable order on disk
+            cache.slots.sort_by(|a, b| a.address.cmp(&b.address).then(a.slot.cmp(&b.slot)));
         }
 
         let json = serde_json::to_string_pretty(&cache)
@@ -516,21 +547,36 @@ impl ForkDb {
             .map_err(|e| ForkError::Cache(format!("write: {}", e)))?;
 
         tracing::info!(
-            "Saved RPC cache: {} accounts, {} slots to {:?}",
-            cache.accounts.len(),
-            cache.storage.len(),
+            "Saved RPC cache: {} contracts, {} slots to {:?}",
+            cache.contracts.len(),
+            cache.slots.len(),
             cache_file
         );
 
         Ok(())
     }
 
-    /// Load cache from disk
+    /// Load cache from disk. Tries the new `rpc-cache-<block>.json` filename
+    /// first (echidna-compatible) and falls back to the legacy
+    /// `rpc_cache_<block>.json` written by older recon builds.
     pub fn load_cache(cache_dir: &Path, block: u64) -> Option<RpcCacheData> {
-        let cache_file = cache_dir.join(format!("rpc_cache_{}.json", block));
-
-        let json = std::fs::read_to_string(&cache_file).ok()?;
-        serde_json::from_str(&json).ok()
+        let primary = cache_dir.join(cache_file_name(block));
+        let legacy = cache_dir.join(format!("rpc_cache_{}.json", block));
+        let path = if primary.exists() {
+            primary
+        } else if legacy.exists() {
+            legacy
+        } else {
+            return None;
+        };
+        let json = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str::<RpcCacheData>(&json) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!("Failed to parse RPC cache {:?}: {}", path, e);
+                None
+            }
+        }
     }
 }
 

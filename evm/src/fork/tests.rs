@@ -52,19 +52,18 @@ fn test_rate_limiter_clone_shares_state() {
 
 #[test]
 fn test_cache_serialization() {
-    use alloy_primitives::{Address, B256, U256};
+    use alloy_primitives::{Address, Bytes, U256};
 
-    let mut cache = RpcCacheData::new(12345, 1);
-    cache.accounts.insert(
+    let mut cache = RpcCacheData::new();
+    cache.contracts.insert(
         Address::ZERO,
         CachedAccount {
+            code: Bytes::new().into(),
+            nonce: U256::from(5),
             balance: U256::from(100),
-            nonce: 5,
-            code_hash: B256::ZERO,
-            code: None,
         },
     );
-    cache.storage.push(CachedSlot {
+    cache.slots.push(CachedSlot {
         address: Address::ZERO,
         slot: U256::from(1),
         value: U256::from(42),
@@ -73,32 +72,30 @@ fn test_cache_serialization() {
     let json = serde_json::to_string(&cache).unwrap();
     let restored: RpcCacheData = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(restored.block, 12345);
-    assert_eq!(restored.chain_id, 1);
-    assert_eq!(restored.accounts.len(), 1);
-    assert_eq!(restored.storage.len(), 1);
+    assert_eq!(restored.contracts.len(), 1);
+    assert_eq!(restored.slots.len(), 1);
+    assert_eq!(restored.slots[0].value, U256::from(42));
 }
 
 #[test]
 fn test_cache_with_code() {
     use alloy_primitives::{Address, Bytes, U256};
 
-    let mut cache = RpcCacheData::new(19000000, 1);
+    let mut cache = RpcCacheData::new();
     let code_bytes = Bytes::from(vec![0x60, 0x80, 0x60, 0x40]); // PUSH1 0x80 PUSH1 0x40
 
-    cache.accounts.insert(
+    cache.contracts.insert(
         Address::repeat_byte(0x42),
         CachedAccount {
+            code: code_bytes.clone().into(),
+            nonce: U256::from(10),
             balance: U256::from(1000),
-            nonce: 10,
-            code_hash: alloy_primitives::keccak256(&code_bytes),
-            code: Some(code_bytes.clone()),
         },
     );
 
     // Add multiple storage slots
     for i in 0..10 {
-        cache.storage.push(CachedSlot {
+        cache.slots.push(CachedSlot {
             address: Address::repeat_byte(0x42),
             slot: U256::from(i),
             value: U256::from(i * 100),
@@ -108,15 +105,105 @@ fn test_cache_with_code() {
     let json = serde_json::to_string_pretty(&cache).unwrap();
     let restored: RpcCacheData = serde_json::from_str(&json).unwrap();
 
-    assert_eq!(restored.block, 19000000);
-    assert_eq!(restored.accounts.len(), 1);
-    assert_eq!(restored.storage.len(), 10);
+    assert_eq!(restored.contracts.len(), 1);
+    assert_eq!(restored.slots.len(), 10);
 
     let restored_account = restored
-        .accounts
+        .contracts
         .get(&Address::repeat_byte(0x42))
         .unwrap();
-    assert_eq!(restored_account.code.as_ref().unwrap(), &code_bytes);
+    assert_eq!(restored_account.code.0, code_bytes);
+}
+
+/// Verify our serializer emits the exact byte layout echidna/hevm uses:
+/// EIP-55 checksum addresses, 64-char zero-padded W256 balance/value, short
+/// hex W64 nonce, and the `(0xAddr,0xshortSlot)` slot key form.
+#[test]
+fn test_echidna_byte_layout() {
+    use alloy_primitives::{Address, Bytes, U256};
+
+    let mut cache = RpcCacheData::new();
+    let addr: Address = "0x836A808d4828586A69364065A1e064609F5078c7"
+        .parse()
+        .unwrap();
+    cache.contracts.insert(
+        addr,
+        CachedAccount {
+            code: Bytes::from(vec![0x60, 0x80]).into(),
+            nonce: U256::from(1),
+            balance: U256::ZERO,
+        },
+    );
+    cache.slots.push(CachedSlot {
+        address: addr,
+        slot: U256::from(7),
+        value: U256::ZERO,
+    });
+
+    let s = serde_json::to_string(&cache).unwrap();
+    // Address checksum casing (matches echidna corpus example)
+    assert!(
+        s.contains("0x836A808d4828586A69364065A1e064609F5078c7"),
+        "missing EIP-55 address: {}",
+        s
+    );
+    // Short-hex nonce
+    assert!(s.contains("\"nonce\":\"0x1\""), "expected short nonce: {}", s);
+    // Padded balance (64 hex chars)
+    assert!(
+        s.contains("\"balance\":\"0x0000000000000000000000000000000000000000000000000000000000000000\""),
+        "expected padded balance: {}",
+        s
+    );
+    // Slot key: short-hex slot, checksummed addr
+    assert!(
+        s.contains("(0x836A808d4828586A69364065A1e064609F5078c7,0x7)"),
+        "slot key shape: {}",
+        s
+    );
+    // Slot value padded
+    assert!(
+        s.contains("0x0000000000000000000000000000000000000000000000000000000000000000"),
+        "padded slot value: {}",
+        s
+    );
+}
+
+/// Cross-tool compatibility: parse the exact schema echidna writes
+/// (`rpc-cache-<block>.json`) and round-trip back to JSON without losing
+/// any addresses, slots, or values.
+#[test]
+fn test_echidna_format_round_trip() {
+    use alloy_primitives::{Address, U256};
+
+    let echidna_json = r#"{
+        "contracts": [
+            ["0x0000000000000000000000000000000000000001",
+             {"code":"0x600160005260206000f3","nonce":"0x0","balance":"0x0"}]
+        ],
+        "slots": [
+            ["(0x0000000000000000000000000000000000000001,0x7)",
+             "0x0000000000000000000000000000000000000000000000000000000000000005"]
+        ],
+        "blocks": {}
+    }"#;
+
+    let parsed: RpcCacheData = serde_json::from_str(echidna_json).expect("parse echidna cache");
+    assert_eq!(parsed.contracts.len(), 1);
+    assert_eq!(parsed.slots.len(), 1);
+
+    let addr: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
+    let acct = parsed.contracts.get(&addr).expect("contract present");
+    assert_eq!(acct.code.0.len(), 10);
+    assert_eq!(acct.nonce, U256::ZERO);
+    assert_eq!(parsed.slots[0].slot, U256::from(7));
+    assert_eq!(parsed.slots[0].value, U256::from(5));
+
+    // Re-serialise and re-parse to ensure stability.
+    let written = serde_json::to_string(&parsed).unwrap();
+    let again: RpcCacheData = serde_json::from_str(&written).unwrap();
+    assert_eq!(again.contracts.len(), 1);
+    assert_eq!(again.slots.len(), 1);
 }
 
 #[test]
