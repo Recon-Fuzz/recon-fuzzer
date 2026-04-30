@@ -296,6 +296,13 @@ pub struct EchidnaTest {
     /// Shrinking context for tracking mode and stuck detection
     #[serde(skip)]
     pub shrink_context: ShrinkContext,
+
+    /// Snapshot of `worker.gen_dict` taken at failure time. Installed as
+    /// the dict for `vm.generateCalls()` during shrink replays so generated
+    /// calls match the original failing run byte-for-byte. `None` for tests
+    /// that didn't involve the cheatcode.
+    #[serde(skip)]
+    pub gen_dict_snapshot: Option<std::sync::Arc<abi::types::GenDict>>,
 }
 
 impl EchidnaTest {
@@ -313,6 +320,7 @@ impl EchidnaTest {
             worker_id: None,
             vm: None,
             shrink_context: ShrinkContext::default(),
+            gen_dict_snapshot: None,
         }
     }
 
@@ -331,6 +339,7 @@ impl EchidnaTest {
             worker_id: None,
             vm: None,
             shrink_context: ShrinkContext::default(),
+            gen_dict_snapshot: None,
         }
     }
 
@@ -396,6 +405,7 @@ pub fn create_tests(
                 worker_id: None,
                 vm: None,
                 shrink_context: ShrinkContext::default(),
+                gen_dict_snapshot: None,
             }]
         }
 
@@ -418,6 +428,7 @@ pub fn create_tests(
                 worker_id: None,
                 vm: None,
                 shrink_context: ShrinkContext::default(),
+                gen_dict_snapshot: None,
             })
             .collect(),
 
@@ -445,6 +456,7 @@ pub fn create_tests(
                 worker_id: None,
                 vm: None,
                 shrink_context: ShrinkContext::default(),
+                gen_dict_snapshot: None,
             });
 
             tests

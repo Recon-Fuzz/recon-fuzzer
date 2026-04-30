@@ -38,13 +38,19 @@ sol! {
     function generateCalls(uint256 count) external returns (bytes[] memory);
 }
 
-/// Context for generating calls via vm.generateCalls()
-/// Set before tx execution by the campaign layer.
+/// Context for generating calls via `vm.generateCalls()`. Set before tx
+/// execution by the campaign layer.
 ///
 /// `gen_dict` is wrapped in `Arc` so propagating the context through the
-/// per-sequence and per-tx wiring is a refcount bump instead of a deep
-/// clone of the entire dictionary (which holds large `whole_calls` /
-/// `dict_values` collections that grow over the lifetime of the run).
+/// per-sequence and per-tx wiring is a refcount bump rather than a deep
+/// clone of the dict (which can hold thousands of entries that grow over
+/// the lifetime of the run).
+///
+/// Determinism guarantee: given the same `rng_seed` and `gen_dict`, every
+/// invocation of the cheatcode produces the same byte stream. The seed
+/// used for each invocation `i` is `rng_seed + sum(n_0..n_{i-1})`, so
+/// multiple `vm.generateCalls(n)` calls within the same tx are also
+/// deterministic and independent.
 #[derive(Debug, Clone)]
 pub struct GenerateCallsContext {
     /// Fuzzable function metadata: (selector, name, param_types)
@@ -52,10 +58,25 @@ pub struct GenerateCallsContext {
     /// Generation dictionary (same as main fuzzer). Read-only at runtime —
     /// the cheatcode never mutates it, so sharing via `Arc` is safe.
     pub gen_dict: std::sync::Arc<abi::types::GenDict>,
-    /// RNG seed for reproducibility
+    /// RNG seed pinned per tx (per-invocation seed = `rng_seed + call_count`).
     pub rng_seed: u64,
-    /// Call counter for incrementing seed
+    /// Cumulative count of calls generated so far in this tx — used to
+    /// advance the seed between invocations so each invocation gets a
+    /// fresh deterministic stream.
     pub call_count: usize,
+    /// Number of invocations made so far in this tx — index into
+    /// `return_masks` and `captured_records`.
+    pub call_index: usize,
+    /// Optional per-invocation keep-mask, indexed by invocation ordinal.
+    /// When `Some(mask)`, only indices `i` with `mask[i] == true` are
+    /// returned to the harness; the rest are generated (to keep the RNG
+    /// stream consistent) but dropped. `None` = return everything.
+    /// Empty vec = capture mode (fresh fuzz, no caller-supplied masks).
+    pub return_masks: Vec<Option<Vec<bool>>>,
+    /// Records captured during this tx, one per invocation in call order.
+    /// Drained by `EvmState` after tx execution so the campaign layer can
+    /// stamp seed + records onto the failing reproducer's `Tx`.
+    pub captured_records: Vec<crate::types::GenerateCallRecord>,
 }
 
 /// Cheatcode state that persists across calls
@@ -127,7 +148,18 @@ pub struct CheatcodeInspector {
     last_opcode: u8,
     /// Context for vm.generateCalls() - set by campaign layer before tx execution
     pub generate_calls_ctx: Option<GenerateCallsContext>,
+    /// Set if any sub-call (any depth) reverted with `Panic(0x01)` —
+    /// solc 0.8+'s encoding of `assert(false)`. Mirrors the same flag on
+    /// `CombinedInspector` so shrink replays (which use `exec_tx` with
+    /// only this inspector) detect nested panics too.
+    pub nested_panic_1: bool,
+    /// Set if any sub-call halted with `InvalidFEOpcode` — the legacy
+    /// (pre-0.8) encoding of `assert(false)`.
+    pub nested_invalid_fe: bool,
 }
+
+/// Selector keccak256("Panic(uint256)")[..4] — Solidity 0.8+ Panic prefix.
+pub(crate) const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 
 /// TIMESTAMP opcode (0x42) - returns block.timestamp
 const OP_TIMESTAMP: u8 = 0x42;
@@ -142,6 +174,8 @@ impl CheatcodeInspector {
             state: CheatcodeState::new(),
             last_opcode: 0,
             generate_calls_ctx: None,
+            nested_panic_1: false,
+            nested_invalid_fe: false,
         }
     }
 
@@ -150,10 +184,62 @@ impl CheatcodeInspector {
         self.last_opcode = opcode;
     }
 
-    /// Generate calldatas for vm.generateCalls(count)
-    /// Returns ABI-encoded bytes[] (array of calldata)
+    /// Regenerate the kept calls for a single `vm.generateCalls(count)`
+    /// invocation given `(rng_seed, count, keep_mask, gen_dict, fuzzable)`.
+    /// Returns `(idx_within_batch, name, args)` for each call kept. Used for
+    /// human-readable rendering of failing reproducers — the cheatcode
+    /// itself uses the same logic but returns ABI-encoded bytes.
     ///
-    /// Uses gen_abi_call_m directly - identical to main fuzzer behavior
+    /// The seed is derived externally as `rng_seed + call_count_so_far` so
+    /// the caller can reproduce a specific invocation within a tx.
+    pub fn regenerate_kept_calls(
+        seed: u64,
+        count: usize,
+        keep_mask: Option<&Vec<bool>>,
+        gen_dict: &abi::types::GenDict,
+        fuzzable_functions: &[(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )],
+    ) -> Vec<(usize, String, Vec<alloy_dyn_abi::DynSolValue>)> {
+        use rand::prelude::*;
+        use rand_chacha::ChaCha8Rng;
+
+        if fuzzable_functions.is_empty() {
+            return Vec::new();
+        }
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let mut out = Vec::new();
+        for j in 0..count {
+            let idx = rng.gen_range(0..fuzzable_functions.len());
+            let (_selector, name, param_types) = &fuzzable_functions[idx];
+            let (resolved_name, args) =
+                abi::r#gen::gen_abi_call_m(&mut rng, gen_dict, name, param_types);
+            let keep = match keep_mask {
+                Some(m) => m.get(j).copied().unwrap_or(true),
+                None => true,
+            };
+            if keep {
+                out.push((j, resolved_name, args));
+            }
+        }
+        out
+    }
+
+    /// Generate calldatas for `vm.generateCalls(count)`. Returns ABI-encoded
+    /// `bytes[]`.
+    ///
+    /// Uses `gen_abi_call_m` directly — identical to the main fuzzer.
+    /// Generation is deterministic given `(rng_seed, call_count)` so the
+    /// same calls reproduce on shrink replay.
+    ///
+    /// If the context has a per-invocation keep-mask for this call index,
+    /// the generated calls are filtered (still generated to keep the RNG
+    /// stream consistent, but dropped from the return value). The full
+    /// `count` always advances `call_count` so the next invocation in the
+    /// tx gets the same seed it would have without any mask applied.
     pub fn generate_calls(&mut self, count: usize) -> Bytes {
         use alloy_dyn_abi::DynSolValue;
         use rand::prelude::*;
@@ -172,34 +258,64 @@ impl CheatcodeInspector {
             return encode_bytes_array(&[]);
         }
 
-        // Use seeded RNG - increment seed each call for different values
+        // Look up the keep-mask for this invocation (if any). Cloned out of
+        // the borrow so we can also push a captured_record below.
+        let invocation_idx = ctx.call_index;
+        let keep_mask: Option<Vec<bool>> = ctx
+            .return_masks
+            .get(invocation_idx)
+            .and_then(|m| m.clone());
+
+        // Per-invocation seed: stable across replays as long as previous
+        // invocations consumed the same total count.
         let seed = ctx.rng_seed.wrapping_add(ctx.call_count as u64);
+        // Advance by the *requested* count (not the kept count) so the
+        // seed for invocation N+1 matches the original failing run even
+        // when invocation N is being shrunk via keep_mask.
         ctx.call_count += count;
+        ctx.call_index += 1;
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-        let mut calls = Vec::with_capacity(count);
-        for _ in 0..count {
+        let mut returned = Vec::with_capacity(count);
+        for j in 0..count {
             // Pick a random function (same as gen_tx)
             let idx = rng.gen_range(0..ctx.fuzzable_functions.len());
             let (selector, name, param_types) = &ctx.fuzzable_functions[idx];
 
-            // Generate call using gen_abi_call_m (identical to main fuzzer)
-            let (_name, args) = abi::r#gen::gen_abi_call_m(&mut rng, &ctx.gen_dict, name, param_types);
+            // Generate call using gen_abi_call_m (identical to main fuzzer).
+            // Always generate — keep_mask only filters the *return* set; the
+            // RNG stream must advance identically to the original run.
+            let (_name, args) =
+                abi::r#gen::gen_abi_call_m(&mut rng, &ctx.gen_dict, name, param_types);
 
-            // Encode to calldata: selector + ABI-encoded args
-            let encoded_args = DynSolValue::Tuple(args).abi_encode();
-            let mut calldata = selector.to_vec();
-            calldata.extend(encoded_args);
-
-            calls.push(Bytes::from(calldata));
+            let keep = match &keep_mask {
+                Some(m) => m.get(j).copied().unwrap_or(true),
+                None => true,
+            };
+            if keep {
+                let encoded_args = DynSolValue::Tuple(args).abi_encode();
+                let mut calldata = selector.to_vec();
+                calldata.extend(encoded_args);
+                returned.push(Bytes::from(calldata));
+            }
         }
 
+        // Record this invocation so the campaign can stamp it onto the tx
+        // for shrink replay. Carry through any caller-supplied keep_mask so
+        // a recorded record round-trips losslessly.
+        ctx.captured_records.push(crate::types::GenerateCallRecord {
+            n: count,
+            keep_mask,
+        });
+
         tracing::trace!(
-            "vm.generateCalls: generated {} calls (seed={})",
-            calls.len(),
-            seed
+            "vm.generateCalls: generated {} of {} calls (seed={}, invocation={})",
+            returned.len(),
+            count,
+            seed,
+            invocation_idx,
         );
-        encode_bytes_array(&calls)
+        encode_bytes_array(&returned)
     }
 
     /// Handle a cheatcode call
@@ -599,6 +715,31 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
         }
         
         None
+    }
+
+    fn call_end(
+        &mut self,
+        _context: &mut CTX,
+        _inputs: &CallInputs,
+        outcome: &mut CallOutcome,
+    ) {
+        // Cheap any-depth assertion-failure detection. Mirrors the equivalent
+        // logic in CombinedInspector so callers that use only this inspector
+        // (notably `EvmState::exec_tx`, hit by every shrink replay) still
+        // observe nested `assert(false)` failures from sub-calls.
+        use revm::interpreter::InstructionResult;
+        match outcome.result.result {
+            InstructionResult::Revert if !self.nested_panic_1 => {
+                let out = &outcome.result.output;
+                if out.len() >= 4 + 32 && out[..4] == PANIC_SELECTOR && out[4 + 31] == 1 {
+                    self.nested_panic_1 = true;
+                }
+            }
+            InstructionResult::InvalidFEOpcode | InstructionResult::OpcodeNotFound => {
+                self.nested_invalid_fe = true;
+            }
+            _ => {}
+        }
     }
 
     fn create(

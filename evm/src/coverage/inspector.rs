@@ -603,12 +603,15 @@ impl CombinedInspector {
     }
 
     /// Set context for vm.generateCalls() cheatcode
-    /// The cheatcode uses gen_abi_call_m directly - identical to main fuzzer
+    /// The cheatcode uses gen_abi_call_m directly - identical to main fuzzer.
+    /// `return_masks` lets the caller restrict which subset of generated
+    /// calls is returned to the harness; pass `Vec::new()` for capture mode.
     pub fn set_generate_calls_context(
         &mut self,
         fuzzable_functions: Vec<(alloy_primitives::FixedBytes<4>, String, Vec<alloy_dyn_abi::DynSolType>)>,
         gen_dict: std::sync::Arc<abi::types::GenDict>,
         rng_seed: u64,
+        return_masks: Vec<Option<Vec<bool>>>,
     ) {
         use crate::cheatcodes::GenerateCallsContext;
         self.cheatcode.generate_calls_ctx = Some(GenerateCallsContext {
@@ -616,6 +619,9 @@ impl CombinedInspector {
             gen_dict,
             rng_seed,
             call_count: 0,
+            call_index: 0,
+            return_masks,
+            captured_records: Vec::new(),
         });
     }
 

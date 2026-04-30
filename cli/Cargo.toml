@@ -9,6 +9,7 @@ name = "recon"
 path = "src/main.rs"
 
 [dependencies]
+abi.workspace = true
 analysis.workspace = true
 campaign.workspace = true
 config.workspace = true

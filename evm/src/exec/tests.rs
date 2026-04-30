@@ -45,6 +45,8 @@ fn test_no_call_tx() {
         gasprice: U256::ZERO,
         value: U256::ZERO,
         delay: (10, 5),
+        generate_calls_seed: None,
+        generate_calls: Vec::new(),
     };
 
     let initial_timestamp = state.timestamp;

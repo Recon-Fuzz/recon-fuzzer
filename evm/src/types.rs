@@ -37,6 +37,36 @@ impl TxCall {
     }
 }
 
+/// One record per `vm.generateCalls(uint256)` invocation made during a tx.
+///
+/// During fuzz, the cheatcode produces calls deterministically from
+/// `(rng_seed, call_count)`. To reproduce a failing run during shrink we
+/// pin both the per-tx seed (on `Tx.generate_calls_seed`) and the per-
+/// invocation parameters captured here. `keep_mask` lets the inner-batch
+/// shrinker keep an arbitrary subset of the originally-generated calls.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenerateCallRecord {
+    /// `count` argument the contract passed to `vm.generateCalls`. The
+    /// cheatcode generates this many calls deterministically; `keep_mask`
+    /// then filters which ones are returned.
+    pub n: usize,
+    /// Replay-time filter: when `Some(mask)`, only indices `i` with
+    /// `mask[i] == true` are returned to the harness; the rest are
+    /// generated (to keep the RNG stream consistent) but dropped. `None`
+    /// means "return all" (no inner-batch shrink applied yet).
+    pub keep_mask: Option<Vec<bool>>,
+}
+
+impl GenerateCallRecord {
+    /// Number of calls that will actually be returned to the harness.
+    pub fn returned_count(&self) -> usize {
+        match &self.keep_mask {
+            Some(m) => m.iter().filter(|b| **b).count(),
+            None => self.n,
+        }
+    }
+}
+
 /// A transaction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
@@ -60,6 +90,19 @@ pub struct Tx {
 
     /// Delay: (time in seconds, block count)
     pub delay: (u64, u64),
+
+    /// Seed used by `vm.generateCalls()` during this tx's run. `None` means
+    /// the cheatcode wasn't invoked (or this tx hasn't run yet). Restored
+    /// verbatim during shrink replay so the same calls are generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_calls_seed: Option<u64>,
+
+    /// One record per `vm.generateCalls()` invocation made during this tx,
+    /// in call order. Empty if the cheatcode wasn't invoked. Carried with
+    /// the tx through shrinking; the inner-batch shrinker prunes
+    /// `keep_mask` per-invocation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generate_calls: Vec<GenerateCallRecord>,
 }
 
 impl Tx {
@@ -82,6 +125,8 @@ impl Tx {
             gasprice: U256::ZERO,
             value: U256::ZERO,
             delay,
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         }
     }
 
@@ -105,6 +150,8 @@ impl Tx {
             gasprice: U256::ZERO,
             value,
             delay,
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         }
     }
 
@@ -118,6 +165,8 @@ impl Tx {
             gasprice: U256::ZERO,
             value: U256::ZERO,
             delay,
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         }
     }
 

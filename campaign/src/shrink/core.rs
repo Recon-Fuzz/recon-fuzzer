@@ -15,7 +15,7 @@ use rand::prelude::*;
 use rayon::prelude::*;
 use std::collections::HashSet;
 
-use evm::exec::EvmState;
+use evm::exec::{EvmState, GenerateCallsRunCtx};
 use evm::types::{absorb_no_calls, cat_no_calls, remove_useless_no_calls, Tx, TxCall};
 
 use crate::config::Env;
@@ -24,6 +24,68 @@ use crate::testing::{
     TestValue,
 };
 use crate::worker_env::WorkerEnv;
+
+/// Wire `vm.generate_calls_context` for the upcoming `vm.exec_tx(tx)`
+/// during shrink replay. This restores the per-tx seed and per-invocation
+/// keep-masks from the captured failing-run record so the cheatcode produces
+/// the same calls (modulo the keep-mask). Must be called once per tx in
+/// the replay, before each `exec_tx`.
+fn install_generate_calls_replay_ctx(
+    vm: &mut EvmState,
+    tx: &Tx,
+    fuzzable_funcs: &[(
+        alloy_primitives::FixedBytes<4>,
+        String,
+        Vec<alloy_dyn_abi::DynSolType>,
+    )],
+    gen_dict: &std::sync::Arc<abi::types::GenDict>,
+) {
+    let Some(seed) = tx.generate_calls_seed else {
+        // This tx never invoked vm.generateCalls() in the failing run —
+        // clear any stale context so an unrelated previous tx's wiring
+        // can't leak into this one.
+        vm.generate_calls_context = None;
+        return;
+    };
+    let masks: Vec<Option<Vec<bool>>> = tx
+        .generate_calls
+        .iter()
+        .map(|r| r.keep_mask.clone())
+        .collect();
+    vm.generate_calls_context = Some(GenerateCallsRunCtx {
+        fuzzable_functions: fuzzable_funcs.to_vec(),
+        gen_dict: gen_dict.clone(),
+        rng_seed: seed,
+        return_masks: masks,
+    });
+}
+
+/// Pull the fuzzable-function table from the main contract (if any).
+/// Returns `None` if no contract is available, or no fuzzable functions
+/// were found.
+fn fuzzable_funcs_from_contract(
+    main_contract: Option<&evm::foundry::CompiledContract>,
+) -> Option<Vec<(
+    alloy_primitives::FixedBytes<4>,
+    String,
+    Vec<alloy_dyn_abi::DynSolType>,
+)>> {
+    let contract = main_contract?;
+    let funcs = contract.fuzzable_functions(true);
+    let out: Vec<_> = funcs
+        .iter()
+        .map(|f| {
+            let selector = f.selector();
+            let param_types = contract.get_param_types(&selector).to_vec();
+            (selector, f.name.clone(), param_types)
+        })
+        .collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
 
 /// Shrink a test's reproducer
 ///
@@ -59,6 +121,30 @@ pub fn shrink_test<R: Rng>(
             // Try to simplify the reproducer
             let mut shrunk = test.clone();
 
+            // Set up the per-tx generateCalls replay context (only when this
+            // test's reproducer used the cheatcode AND we have a snapshot
+            // dict frozen at failure time). Cached and reused across all
+            // exec_tx calls within this shrink iteration.
+            let gen_calls_setup: Option<(
+                Vec<(
+                    alloy_primitives::FixedBytes<4>,
+                    String,
+                    Vec<alloy_dyn_abi::DynSolType>,
+                )>,
+                std::sync::Arc<abi::types::GenDict>,
+            )> = match (
+                test.gen_dict_snapshot.as_ref(),
+                test.reproducer
+                    .iter()
+                    .any(|t| t.generate_calls_seed.is_some()),
+            ) {
+                (Some(snapshot), true) => {
+                    fuzzable_funcs_from_contract(env.main_contract.as_ref())
+                        .map(|funcs| (funcs, snapshot.clone()))
+                }
+                _ => None,
+            };
+
             // Remove reverts (removeReverts vm test.reproducer)
             // This needs its own VM clone since it modifies state during execution
             let mut vm_for_remove_reverts = initial_vm.clone();
@@ -66,6 +152,7 @@ pub fn shrink_test<R: Rng>(
                 &mut vm_for_remove_reverts,
                 &test.reproducer,
                 &env.world.view_pure_functions,
+                gen_calls_setup.as_ref(),
             )?;
             let simplified = remove_useless_no_calls(absorb_no_calls(cat_no_calls(simplified)));
 
@@ -113,7 +200,12 @@ pub fn shrink_test<R: Rng>(
             // Validate that simplified sequence still fails the test before accepting
             // (shrinkSeq validates before accepting)
             let mut vm_for_validate = initial_vm.clone();
-            let val = execute_and_check(&mut vm_for_validate, &simplified, test)?;
+            let val = execute_and_check(
+                &mut vm_for_validate,
+                &simplified,
+                test,
+                gen_calls_setup.as_ref(),
+            )?;
 
             match (&val, &test.value) {
                 // Test still fails - accept simplified as final reproducer
@@ -162,10 +254,23 @@ fn can_shrink_tx(tx: &Tx) -> bool {
 ///
 /// Executes transactions on the VM, replacing any that revert OR are pure/view with NoCall.
 /// Pure/view functions don't modify state, so they can be removed to simplify reproducers.
+///
+/// `gen_calls_setup` enables `vm.generateCalls()` determinism per tx during
+/// the simulation here — without it, replay reverts that the original run
+/// didn't see (because random reentrancy calldatas differ) would falsely
+/// look like reverts that should be replaced.
 fn remove_reverts(
     vm: &mut EvmState,
     txs: &[Tx],
     view_pure_functions: &std::collections::HashSet<String>,
+    gen_calls_setup: Option<&(
+        Vec<(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )>,
+        std::sync::Arc<abi::types::GenDict>,
+    )>,
 ) -> anyhow::Result<Vec<Tx>> {
     if txs.is_empty() {
         return Ok(vec![]);
@@ -174,6 +279,11 @@ fn remove_reverts(
     let (init, last) = txs.split_at(txs.len() - 1);
     let mut result = Vec::with_capacity(txs.len());
 
+    // Accumulate nested-panic flags across the dry-run so the caller's
+    // subsequent `execute_and_check` doesn't see a clobbered view (only
+    // the last tx's flags would otherwise be left on `vm`).
+    let mut acc_nested_panic_1 = false;
+    let mut acc_nested_invalid_fe = false;
     for tx in init {
         // Check if this is a pure/view function call (doesn't modify state)
         let is_view_pure = match &tx.call {
@@ -186,7 +296,12 @@ fn remove_reverts(
             result.push(Tx::no_call(tx.src, tx.dst, tx.delay));
         } else {
             // Execute and check for revert
+            if let Some((funcs, dict)) = gen_calls_setup {
+                install_generate_calls_replay_ctx(vm, tx, funcs, dict);
+            }
             let tx_result = vm.exec_tx(tx)?;
+            acc_nested_panic_1 |= vm.last_nested_panic_1;
+            acc_nested_invalid_fe |= vm.last_nested_invalid_fe;
             if tx_result.is_revert() {
                 // Replace with NoCall but keep delay (replaceByNoCall)
                 result.push(Tx::no_call(tx.src, tx.dst, tx.delay));
@@ -195,6 +310,8 @@ fn remove_reverts(
             }
         }
     }
+    vm.last_nested_panic_1 = acc_nested_panic_1;
+    vm.last_nested_invalid_fe = acc_nested_invalid_fe;
 
     // Keep the last transaction as-is (it's the one that triggers the failure)
     result.extend(last.iter().cloned());
@@ -219,6 +336,26 @@ fn shrink_seq<R: Rng>(
     if txs.is_empty() {
         return Ok(None);
     }
+
+    // Build the per-tx generateCalls replay context once for the whole
+    // shrink iteration (cheap clones into Rayon workers below).
+    let gen_calls_setup: Option<(
+        Vec<(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )>,
+        std::sync::Arc<abi::types::GenDict>,
+    )> = match (
+        test.gen_dict_snapshot.as_ref(),
+        txs.iter().any(|t| t.generate_calls_seed.is_some()),
+    ) {
+        (Some(snapshot), true) => {
+            fuzzable_funcs_from_contract(env.main_contract.as_ref())
+                        .map(|funcs| (funcs, snapshot.clone()))
+        }
+        _ => None,
+    };
 
     // Get sorted senders for shrinkSender 
     let mut sorted_senders: Vec<Address> = env.cfg.sol_conf.sender.iter().cloned().collect();
@@ -255,7 +392,14 @@ fn shrink_seq<R: Rng>(
             generate_delay_candidates(rng, txs, &mut candidates);
             // Call-to-delay conversion: convert random txs to NoCalls, merge consecutive
             if txs.len() > 2 {
-                generate_call_to_delay_candidates(rng, txs, initial_vm, test, &mut candidates);
+                generate_call_to_delay_candidates(
+                    rng,
+                    txs,
+                    initial_vm,
+                    test,
+                    &mut candidates,
+                    gen_calls_setup.as_ref(),
+                );
             }
         }
         ShrinkMode::ValueOnly => {
@@ -278,7 +422,14 @@ fn shrink_seq<R: Rng>(
             generate_delay_candidates(rng, txs, &mut candidates);
             // Call-to-delay conversion (also useful in ValueOnly — can reduce length)
             if txs.len() > 2 {
-                generate_call_to_delay_candidates(rng, txs, initial_vm, test, &mut candidates);
+                generate_call_to_delay_candidates(
+                    rng,
+                    txs,
+                    initial_vm,
+                    test,
+                    &mut candidates,
+                    gen_calls_setup.as_ref(),
+                );
             }
         }
     }
@@ -295,7 +446,8 @@ fn shrink_seq<R: Rng>(
         .into_par_iter()
         .filter_map(|candidate| {
             let mut vm = initial_vm.clone();
-            let val = execute_and_check(&mut vm, &candidate, test).ok()?;
+            let val = execute_and_check(&mut vm, &candidate, test, gen_calls_setup.as_ref())
+                .ok()?;
 
             match (&val, test_value) {
                 (TestValue::BoolValue(false), _) => Some((candidate, val)),
@@ -331,17 +483,47 @@ fn shrink_seq<R: Rng>(
 ///   (_, vm'') <- execTx vm' x
 ///   check xs' vm''
 /// ```
+///
+/// `gen_calls_setup` is the (fuzzable_functions, dict_snapshot) pair to use
+/// when restoring `vm.generateCalls()` determinism per tx. Pass `None` if
+/// the test's reproducer never invoked the cheatcode (cheap check on the
+/// caller's side avoids unnecessary work).
 fn execute_and_check(
     vm: &mut EvmState,
     txs: &[Tx],
     test: &EchidnaTest,
+    gen_calls_setup: Option<&(
+        Vec<(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )>,
+        std::sync::Arc<abi::types::GenDict>,
+    )>,
 ) -> anyhow::Result<TestValue> {
     use crate::testing::check_etest;
 
-    // Execute all transactions in order
+    // Execute all transactions in order. The nested-panic flags
+    // (`vm.last_nested_panic_1` / `vm.last_nested_invalid_fe`) are written by
+    // every tx, so without accumulation an earlier tx that *did* trigger the
+    // bug gets its flag clobbered by a later non-bug tx, and `check_etest`
+    // below sees a stale `false`. Mirror the fuzz-time semantics (test is
+    // checked right after each tx) by OR-ing the flags across the whole
+    // replay before checking.
+    let mut acc_nested_panic_1 = false;
+    let mut acc_nested_invalid_fe = false;
     for tx in txs {
+        if let Some((funcs, dict)) = gen_calls_setup {
+            install_generate_calls_replay_ctx(vm, tx, funcs, dict);
+        }
         vm.exec_tx(tx)?;
+        acc_nested_panic_1 |= vm.last_nested_panic_1;
+        acc_nested_invalid_fe |= vm.last_nested_invalid_fe;
     }
+    // Reinstall the accumulated flags so check_assertion / check_call_test
+    // see the same view of the sequence the fuzz path saw at failure time.
+    vm.last_nested_panic_1 = acc_nested_panic_1;
+    vm.last_nested_invalid_fe = acc_nested_invalid_fe;
 
     // Check using check_etest (f vm' where f = checkETest test)
     let sender = txs.last().map(|t| t.src).unwrap_or(Address::ZERO);
@@ -421,11 +603,33 @@ pub fn shrink_test_worker<R: Rng>(
 
             let mut shrunk = test.clone();
 
+            // Set up the per-tx generateCalls replay context (only when this
+            // test's reproducer used the cheatcode AND we have a snapshot
+            // dict frozen at failure time).
+            let gen_calls_setup: Option<(
+                Vec<(
+                    alloy_primitives::FixedBytes<4>,
+                    String,
+                    Vec<alloy_dyn_abi::DynSolType>,
+                )>,
+                std::sync::Arc<abi::types::GenDict>,
+            )> = match (
+                test.gen_dict_snapshot.as_ref(),
+                test.reproducer
+                    .iter()
+                    .any(|t| t.generate_calls_seed.is_some()),
+            ) {
+                (Some(snapshot), true) => fuzzable_funcs_from_contract(env.main_contract.as_ref())
+                    .map(|funcs| (funcs, snapshot.clone())),
+                _ => None,
+            };
+
             let mut vm_for_remove_reverts = initial_vm.clone();
             let simplified = remove_reverts(
                 &mut vm_for_remove_reverts,
                 &test.reproducer,
                 &env.world.view_pure_functions,
+                gen_calls_setup.as_ref(),
             )?;
             let simplified = remove_useless_no_calls(absorb_no_calls(cat_no_calls(simplified)));
 
@@ -473,6 +677,128 @@ pub fn shrink_test_worker<R: Rng>(
     }
 }
 
+/// Inner-batch ddmin: for each `vm.generateCalls()` invocation in the
+/// failing reproducer, find the smallest subset of generated calls that
+/// still triggers the bug. Mutates `test.reproducer[*].generate_calls[*].keep_mask`
+/// in place. Should be invoked once, after the main sequence shrink has
+/// converged (`TestState::Solved`).
+///
+/// Algorithm: greedy single-call removal per invocation, repeated until no
+/// progress. For 100 generated calls this is O(100 × passes) replays per
+/// invocation; with sequence sizes typical of shrunk reproducers (≤ 5-10
+/// txs), each replay is sub-millisecond, so the whole pass completes well
+/// under a minute even for several invocations of size 100.
+///
+/// Determinism: replays restore `generate_calls_seed` per tx and use the
+/// test's frozen `gen_dict_snapshot` (stamped by `update_open_test`), so
+/// generated bytes match the original failing run exactly. The keep_mask
+/// only filters which calls are *returned* to the harness; the RNG stream
+/// always advances by the original `n` so subsequent invocations within
+/// the same tx remain consistent.
+pub fn shrink_inner_batches_worker(
+    env: &WorkerEnv,
+    initial_vm: &EvmState,
+    test: &mut EchidnaTest,
+) -> anyhow::Result<()> {
+    // Cheap skip when this test never invoked the cheatcode.
+    if !test
+        .reproducer
+        .iter()
+        .any(|t| t.generate_calls_seed.is_some())
+    {
+        return Ok(());
+    }
+
+    let Some(dict) = test.gen_dict_snapshot.clone() else {
+        // Without a frozen dict snapshot we can't guarantee deterministic
+        // replay — bail rather than risk a wrong shrink.
+        return Ok(());
+    };
+    let Some(funcs) = fuzzable_funcs_from_contract(env.main_contract.as_ref()) else {
+        return Ok(());
+    };
+    let setup = (funcs, dict);
+
+    // Sanity check: replay the unchanged reproducer once. If this doesn't
+    // reproduce the failure, replay determinism is broken and ddmin can't do
+    // anything useful — bail rather than waste thousands of trials.
+    {
+        let mut vm = initial_vm.clone();
+        let val = execute_and_check(&mut vm, &test.reproducer, test, Some(&setup))?;
+        let baseline_fails = match (&val, &test.value) {
+            (TestValue::BoolValue(false), _) => true,
+            (TestValue::IntValue(new), TestValue::IntValue(old)) => new >= old,
+            _ => false,
+        };
+        if !baseline_fails {
+            tracing::warn!(
+                "Inner-batch shrink: baseline replay does not reproduce failure for {}; skipping.",
+                test.test_type.name()
+            );
+            return Ok(());
+        }
+    }
+
+    let total_txs = test.reproducer.len();
+    for tx_idx in 0..total_txs {
+        let total_inv = test.reproducer[tx_idx].generate_calls.len();
+        for inv_idx in 0..total_inv {
+            let n = test.reproducer[tx_idx].generate_calls[inv_idx].n;
+            if n <= 1 {
+                // Nothing to ddmin: 0 calls is empty, 1 call can't shrink.
+                continue;
+            }
+
+            // Start from the existing mask (None == all true) and try to
+            // drop one call at a time until no further drops keep the
+            // failure.
+            let mut current_mask: Vec<bool> = test.reproducer[tx_idx].generate_calls[inv_idx]
+                .keep_mask
+                .clone()
+                .unwrap_or_else(|| vec![true; n]);
+            let mut progress = true;
+            while progress {
+                progress = false;
+                for j in 0..n {
+                    if !current_mask[j] {
+                        continue;
+                    }
+                    let mut trial = current_mask.clone();
+                    trial[j] = false;
+
+                    // Replay the full sequence with the trial mask installed
+                    // on this single invocation (other invocations keep their
+                    // current masks so simultaneous inner shrinks compose).
+                    let mut candidate = test.reproducer.clone();
+                    candidate[tx_idx].generate_calls[inv_idx].keep_mask = Some(trial.clone());
+
+                    let mut vm = initial_vm.clone();
+                    let val = execute_and_check(&mut vm, &candidate, test, Some(&setup))?;
+                    let still_fails = match (&val, &test.value) {
+                        (TestValue::BoolValue(false), _) => true,
+                        (TestValue::IntValue(new), TestValue::IntValue(old)) => new >= old,
+                        _ => false,
+                    };
+                    if still_fails {
+                        current_mask = trial;
+                        progress = true;
+                    }
+                }
+            }
+
+            // Persist the minimal mask. Store `None` when all calls are
+            // kept (no shrink) so reporting can stay terse.
+            let any_drop = current_mask.iter().any(|b| !*b);
+            test.reproducer[tx_idx].generate_calls[inv_idx].keep_mask = if any_drop {
+                Some(current_mask)
+            } else {
+                None
+            };
+        }
+    }
+    Ok(())
+}
+
 /// Shrink a transaction sequence (WorkerEnv variant)
 ///
 /// OPTIMIZED: Uses parallel candidate validation for faster shrinking
@@ -491,7 +817,25 @@ fn shrink_seq_worker<R: Rng>(
         return Ok(None);
     }
 
-    // Get sorted senders for shrinkSender 
+    // Build the per-tx generateCalls replay context once for the whole
+    // shrink iteration (cheap clones into Rayon workers below).
+    let gen_calls_setup: Option<(
+        Vec<(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )>,
+        std::sync::Arc<abi::types::GenDict>,
+    )> = match (
+        test.gen_dict_snapshot.as_ref(),
+        txs.iter().any(|t| t.generate_calls_seed.is_some()),
+    ) {
+        (Some(snapshot), true) => fuzzable_funcs_from_contract(env.main_contract.as_ref())
+            .map(|funcs| (funcs, snapshot.clone())),
+        _ => None,
+    };
+
+    // Get sorted senders for shrinkSender
     let mut sorted_senders: Vec<Address> = env.cfg.sol_conf.sender.iter().cloned().collect();
     sorted_senders.sort();
 
@@ -526,7 +870,14 @@ fn shrink_seq_worker<R: Rng>(
             generate_delay_candidates(rng, txs, &mut candidates);
             // Call-to-delay conversion: convert random txs to NoCalls, merge consecutive
             if txs.len() > 2 {
-                generate_call_to_delay_candidates(rng, txs, initial_vm, test, &mut candidates);
+                generate_call_to_delay_candidates(
+                    rng,
+                    txs,
+                    initial_vm,
+                    test,
+                    &mut candidates,
+                    gen_calls_setup.as_ref(),
+                );
             }
         }
         ShrinkMode::ValueOnly => {
@@ -549,7 +900,14 @@ fn shrink_seq_worker<R: Rng>(
             generate_delay_candidates(rng, txs, &mut candidates);
             // Call-to-delay conversion (also useful in ValueOnly — can reduce length)
             if txs.len() > 2 {
-                generate_call_to_delay_candidates(rng, txs, initial_vm, test, &mut candidates);
+                generate_call_to_delay_candidates(
+                    rng,
+                    txs,
+                    initial_vm,
+                    test,
+                    &mut candidates,
+                    gen_calls_setup.as_ref(),
+                );
             }
         }
     }
@@ -567,7 +925,8 @@ fn shrink_seq_worker<R: Rng>(
         .filter_map(|candidate| {
             // Each parallel task gets its own VM clone
             let mut vm = initial_vm.clone();
-            let val = execute_and_check(&mut vm, &candidate, test).ok()?;
+            let val = execute_and_check(&mut vm, &candidate, test, gen_calls_setup.as_ref())
+                .ok()?;
 
             // Check if this candidate is valid (test still fails)
             match (&val, test_value) {
@@ -693,6 +1052,14 @@ fn generate_call_to_delay_candidates<R: Rng>(
     initial_vm: &EvmState,
     test: &EchidnaTest,
     candidates: &mut Vec<Vec<Tx>>,
+    gen_calls_setup: Option<&(
+        Vec<(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )>,
+        std::sync::Arc<abi::types::GenDict>,
+    )>,
 ) {
     let len = txs.len();
     if len <= 2 {
@@ -737,7 +1104,7 @@ fn generate_call_to_delay_candidates<R: Rng>(
 
             // Check: does the test still fail with this conversion?
             let mut vm = initial_vm.clone();
-            let still_fails = match execute_and_check(&mut vm, &candidate, test) {
+            let still_fails = match execute_and_check(&mut vm, &candidate, test, gen_calls_setup) {
                 Ok(TestValue::BoolValue(false)) => true,
                 _ => false,
             };

@@ -1425,7 +1425,12 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                     any_failed = true;
                     println!("{}(): failed!💥", test_name);
                 }
-                print_call_sequence(&test.reproducer, contract_name);
+                print_call_sequence_with_decode(
+                    &test.reproducer,
+                    contract_name,
+                    test,
+                    Some(&main_contract),
+                );
 
                 // Print detailed traces for the falsified sequence
                 if !is_optimization && !test.reproducer.is_empty() {
@@ -1436,6 +1441,7 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                         &env.contracts,
                         &deployed_addresses,
                         Some(&main_contract),
+                        test.gen_dict_snapshot.as_ref(),
                     );
                 }
             }
@@ -1458,7 +1464,12 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                     println!("{}(): failed!💥", test_name);
                     println!("  Call sequence, shrinking {}/{}:", n, shrink_limit);
                 }
-                print_call_sequence(&test.reproducer, contract_name);
+                print_call_sequence_with_decode(
+                    &test.reproducer,
+                    contract_name,
+                    test,
+                    Some(&main_contract),
+                );
 
                 // Print detailed traces for the falsified sequence (even while shrinking)
                 if !is_optimization && !test.reproducer.is_empty() {
@@ -1469,6 +1480,7 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                         &env.contracts,
                         &deployed_addresses,
                         Some(&main_contract),
+                        test.gen_dict_snapshot.as_ref(),
                     );
                 }
             }
@@ -1660,7 +1672,7 @@ fn replay_sequence(
     // Note: reentrancy call context is not available in standalone replay mode
     // Use fuzzing mode to see reentrancy calls in traces
     println!("Execution traces:");
-    campaign::output::print_traces(vm, &txs, contract_name, contracts, deployed_addresses, None);
+    campaign::output::print_traces(vm, &txs, contract_name, contracts, deployed_addresses, None, None);
 
     Ok(())
 }
@@ -1859,7 +1871,12 @@ fn run_shrink_mode(
                     _ => unreachable!(),
                 };
                 println!("{}(): {}", name, state_msg);
-                print_call_sequence(&test.reproducer, contract_name);
+                print_call_sequence_with_decode(
+                    &test.reproducer,
+                    contract_name,
+                    test,
+                    env.main_contract.as_ref(),
+                );
 
                 // Save the best reproducer to disk
                 if !test.reproducer.is_empty() {
@@ -1882,6 +1899,7 @@ fn run_shrink_mode(
                         &env.contracts,
                         deployed_addresses,
                         Some(main_contract),
+                        test.gen_dict_snapshot.as_ref(),
                     );
                 }
             }
@@ -1921,6 +1939,61 @@ fn print_call_sequence(txs: &[evm::types::Tx], contract_name: &str) {
     println!("  Call sequence:");
     for tx in txs {
         println!("    {}", campaign::output::format_tx(tx, contract_name));
+        for line in campaign::output::format_generate_calls(tx, None) {
+            println!("    {}", line);
+        }
+    }
+}
+
+/// Pretty-print a call sequence with `vm.generateCalls()` decode (if a
+/// dict snapshot + main contract are available on the test).
+fn print_call_sequence_with_decode(
+    txs: &[evm::types::Tx],
+    contract_name: &str,
+    test: &campaign::testing::EchidnaTest,
+    main_contract: Option<&evm::foundry::CompiledContract>,
+) {
+    if txs.is_empty() {
+        println!("  (no transactions)");
+        return;
+    }
+
+    let decode_args: Option<(
+        std::sync::Arc<abi::types::GenDict>,
+        Vec<(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )>,
+        String,
+    )> = (|| {
+        let dict = test.gen_dict_snapshot.clone()?;
+        let contract = main_contract?;
+        let fuzzable = contract.fuzzable_functions(true);
+        let funcs: Vec<_> = fuzzable
+            .iter()
+            .map(|f| {
+                let selector = f.selector();
+                let param_types = contract.get_param_types(&selector).to_vec();
+                (selector, f.name.clone(), param_types)
+            })
+            .collect();
+        if funcs.is_empty() {
+            None
+        } else {
+            Some((dict, funcs, contract.name.clone()))
+        }
+    })();
+
+    println!("  Call sequence:");
+    for tx in txs {
+        println!("    {}", campaign::output::format_tx(tx, contract_name));
+        let dw = decode_args
+            .as_ref()
+            .map(|(d, f, n)| (d, f.as_slice(), n.as_str()));
+        for line in campaign::output::format_generate_calls(tx, dw) {
+            println!("    {}", line);
+        }
     }
 }
 

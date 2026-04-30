@@ -24,6 +24,40 @@ fn try_write_repro(env: &WorkerEnv, test: &EchidnaTest) {
     }
 }
 
+/// Build the `decode_with` tuple for `format_generate_calls` from the
+/// worker env and a test that has a frozen dict snapshot. Returns `None`
+/// if either piece is missing — the caller falls back to undecoded
+/// rendering (just seeds + indices).
+fn build_decode_args(
+    env: &WorkerEnv,
+    test: &EchidnaTest,
+) -> Option<(
+    Arc<abi::types::GenDict>,
+    Vec<(
+        alloy_primitives::FixedBytes<4>,
+        String,
+        Vec<alloy_dyn_abi::DynSolType>,
+    )>,
+    String,
+)> {
+    let dict = test.gen_dict_snapshot.clone()?;
+    let contract = env.main_contract.as_ref()?;
+    let fuzzable = contract.fuzzable_functions(true);
+    let funcs: Vec<_> = fuzzable
+        .iter()
+        .map(|f| {
+            let selector = f.selector();
+            let param_types = contract.get_param_types(&selector).to_vec();
+            (selector, f.name.clone(), param_types)
+        })
+        .collect();
+    if funcs.is_empty() {
+        None
+    } else {
+        Some((dict, funcs, contract.name.clone()))
+    }
+}
+
 /// Shrink tests that this worker owns (WorkerEnv variant)
 /// force_stop: If true, skip shrinking and return immediately (second Ctrl+C)
 pub fn shrink_pending_tests_worker(
@@ -52,10 +86,45 @@ pub fn shrink_pending_tests_worker(
             if n >= shrink_limit as i32 {
                 test.shrink_complete();
 
+                // Inner-batch ddmin: prune `vm.generateCalls()` results
+                // to the minimal subset that still triggers the bug.
+                let mut vm_for_inner = initial_vm.clone();
+                if let Err(e) = super::shrink_inner_batches_worker(
+                    env,
+                    &mut vm_for_inner,
+                    &mut test,
+                ) {
+                    tracing::warn!(
+                        "Inner-batch shrink failed for {}: {}",
+                        test.test_type.name(),
+                        e
+                    );
+                }
+
                 output::print_worker_msg(
                     worker.worker_id,
                     &format!("Shrinking {} complete.", test.test_type.name()),
                 );
+                // Pretty-print the shrunk sequence with per-tx
+                // generateCalls annotations (decoded when we have the
+                // dict snapshot + main contract).
+                let cname = env
+                    .main_contract
+                    .as_ref()
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("Contract");
+                let decode_args = build_decode_args(env, &test);
+                let dw = decode_args
+                    .as_ref()
+                    .map(|(d, f, n)| (d, f.as_slice(), n.as_str()));
+                println!("  Shrunk call sequence:");
+                for tx in &test.reproducer {
+                    println!("    {}", output::format_tx(tx, cname));
+                    for line in output::format_generate_calls(tx, dw) {
+                        println!("    {}", line);
+                    }
+                }
+                println!();
 
                 if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                     tracing::error!("Failed to save shrunk reproducer: {}", e);
@@ -72,14 +141,55 @@ pub fn shrink_pending_tests_worker(
             } else {
                 let mut vm_for_shrink = initial_vm.clone();
 
-                if let Some(shrunk_test) =
+                if let Some(mut shrunk_test) =
                     super::shrink_test_worker(env, &mut vm_for_shrink, &test, rng)?
                 {
                     if matches!(shrunk_test.state, TestState::Solved) {
+                        // Inner-batch ddmin: prune `vm.generateCalls()` results
+                        // down to the minimal subset that still triggers the
+                        // bug. Only does work when the test invoked the
+                        // cheatcode and we have a frozen dict snapshot;
+                        // otherwise no-op.
+                        let mut vm_for_inner = initial_vm.clone();
+                        if let Err(e) = super::shrink_inner_batches_worker(
+                            env,
+                            &mut vm_for_inner,
+                            &mut shrunk_test,
+                        ) {
+                            tracing::warn!(
+                                "Inner-batch shrink failed for {}: {}",
+                                shrunk_test.test_type.name(),
+                                e
+                            );
+                        }
+
                         output::print_worker_msg(
                             worker.worker_id,
-                            &format!("Shrinking {} complete.", shrunk_test.test_type.name()),
+                            &format!(
+                                "Shrinking {} complete (len {}).",
+                                shrunk_test.test_type.name(),
+                                shrunk_test.reproducer.len()
+                            ),
                         );
+                        // Pretty-print the shrunk sequence with per-tx
+                        // generateCalls annotations (seeds + kept indices).
+                        let cname = env
+                            .main_contract
+                            .as_ref()
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("Contract");
+                        let decode_args = build_decode_args(env, &shrunk_test);
+                        let dw = decode_args
+                            .as_ref()
+                            .map(|(d, f, n)| (d, f.as_slice(), n.as_str()));
+                        println!("  Shrunk call sequence:");
+                        for tx in &shrunk_test.reproducer {
+                            println!("    {}", output::format_tx(tx, cname));
+                            for line in output::format_generate_calls(tx, dw) {
+                                println!("    {}", line);
+                            }
+                        }
+                        println!();
 
                         if let Err(e) =
                             output::save_shrunk_reproducer_worker(env, &shrunk_test.reproducer)
@@ -263,6 +373,23 @@ pub fn close_and_shrink_optimization_tests(
                 // Check if we've reached shrink limit for this test
                 if n >= shrink_limit as i32 {
                     test.shrink_complete();
+
+                    // Inner-batch ddmin: prune `vm.generateCalls()` results
+                    // to the minimal subset that still triggers the bug.
+                    // Same as the converged-Solved path below.
+                    let mut vm_for_inner = initial_vm.clone();
+                    if let Err(e) = super::shrink_inner_batches_worker(
+                        env,
+                        &mut vm_for_inner,
+                        &mut test,
+                    ) {
+                        tracing::warn!(
+                            "Inner-batch shrink failed for {}: {}",
+                            test.test_type.name(),
+                            e
+                        );
+                    }
+
                     output::print_worker_msg(
                         worker.worker_id,
                         &format!(
@@ -272,6 +399,26 @@ pub fn close_and_shrink_optimization_tests(
                             test.reproducer.len()
                         ),
                     );
+                    // Pretty-print the shrunk sequence with per-tx
+                    // generateCalls annotations.
+                    let cname = env
+                        .main_contract
+                        .as_ref()
+                        .map(|c| c.name.as_str())
+                        .unwrap_or("Contract");
+                    let decode_args = build_decode_args(env, &test);
+                    let dw = decode_args
+                        .as_ref()
+                        .map(|(d, f, n)| (d, f.as_slice(), n.as_str()));
+                    println!("  Shrunk call sequence:");
+                    for tx in &test.reproducer {
+                        println!("    {}", output::format_tx(tx, cname));
+                        for line in output::format_generate_calls(tx, dw) {
+                            println!("    {}", line);
+                        }
+                    }
+                    println!();
+
                     if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
                         tracing::error!("Failed to save shrunk reproducer: {}", e);
                     }
@@ -289,10 +436,26 @@ pub fn close_and_shrink_optimization_tests(
 
                 let mut vm_for_shrink = initial_vm.clone();
 
-                if let Some(shrunk_test) =
+                if let Some(mut shrunk_test) =
                     super::shrink_test_worker(env, &mut vm_for_shrink, &test, rng)?
                 {
                     if matches!(shrunk_test.state, TestState::Solved) {
+                        // Inner-batch ddmin: prune `vm.generateCalls()` results
+                        // down to the minimal subset that still triggers the
+                        // bug. No-op when the cheatcode wasn't used.
+                        let mut vm_for_inner = initial_vm.clone();
+                        if let Err(e) = super::shrink_inner_batches_worker(
+                            env,
+                            &mut vm_for_inner,
+                            &mut shrunk_test,
+                        ) {
+                            tracing::warn!(
+                                "Inner-batch shrink failed for {}: {}",
+                                shrunk_test.test_type.name(),
+                                e
+                            );
+                        }
+
                         output::print_worker_msg(
                             worker.worker_id,
                             &format!(
@@ -301,6 +464,25 @@ pub fn close_and_shrink_optimization_tests(
                                 shrunk_test.reproducer.len()
                             ),
                         );
+                        // Pretty-print the shrunk sequence with per-tx
+                        // generateCalls annotations.
+                        let cname = env
+                            .main_contract
+                            .as_ref()
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("Contract");
+                        let decode_args = build_decode_args(env, &shrunk_test);
+                        let dw = decode_args
+                            .as_ref()
+                            .map(|(d, f, n)| (d, f.as_slice(), n.as_str()));
+                        println!("  Shrunk call sequence:");
+                        for tx in &shrunk_test.reproducer {
+                            println!("    {}", output::format_tx(tx, cname));
+                            for line in output::format_generate_calls(tx, dw) {
+                                println!("    {}", line);
+                            }
+                        }
+                        println!();
 
                         if let Err(e) =
                             output::save_shrunk_reproducer_worker(env, &shrunk_test.reproducer)
