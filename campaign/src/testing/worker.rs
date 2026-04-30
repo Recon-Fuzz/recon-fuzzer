@@ -71,6 +71,23 @@ pub fn check_tests_after_tx_worker(
             }
 
             let is_optimization = matches!(deferred_kind, DeferredCheck::Optimization);
+            // Snapshot the dict iff any tx in the reproducer invoked
+            // vm.generateCalls(). Source the snapshot from the Arc pinned on
+            // `vm.generate_calls_context` (set once at sequence start) — NOT
+            // from `worker.gen_dict`, which drifts as each successful tx
+            // appends new calls. Using the live worker dict here breaks
+            // shrink-replay determinism: same seed + drifted dict → different
+            // generated calls → no candidate validates.
+            let snapshot = if executed_so_far
+                .iter()
+                .any(|t| t.generate_calls_seed.is_some())
+            {
+                vm.generate_calls_context
+                    .as_ref()
+                    .map(|gc| gc.gen_dict.clone())
+            } else {
+                None
+            };
             let test_updated = update_open_test(
                 &mut test,
                 executed_so_far.to_vec(),
@@ -78,6 +95,7 @@ pub fn check_tests_after_tx_worker(
                 res,
                 worker.worker_id,
                 vm,
+                snapshot,
             );
 
             if test_updated {
@@ -110,6 +128,8 @@ pub fn check_tests_after_tx_worker(
                                 value: alloy_primitives::U256::ZERO,
                                 gas: 12_500_000,
                                 delay: (0, 0),
+                                generate_calls_seed: None,
+                                generate_calls: Vec::new(),
                             };
                             let mut seq_with_test = test.reproducer.clone();
                             seq_with_test.push(opt_test_tx);
@@ -174,6 +194,19 @@ pub fn check_tests_after_tx_worker(
                 test.result = res;
                 test.value = val;
                 test.worker_id = Some(worker.worker_id);
+                // Snapshot the dict iff any tx in the reproducer used
+                // vm.generateCalls(). Source from the Arc pinned on
+                // `vm.generate_calls_context` (set at sequence start) — NOT
+                // from `worker.gen_dict`, which drifts as txs append calls.
+                if executed_so_far
+                    .iter()
+                    .any(|t| t.generate_calls_seed.is_some())
+                {
+                    test.gen_dict_snapshot = vm
+                        .generate_calls_context
+                        .as_ref()
+                        .map(|gc| gc.gen_dict.clone());
+                }
 
                 output::print_worker_msg(
                     worker.worker_id,
@@ -239,6 +272,15 @@ pub fn check_cheap_tests_after_tx_worker(
             test.result = res;
             test.value = val;
             test.worker_id = Some(worker.worker_id);
+            if executed_so_far
+                .iter()
+                .any(|t| t.generate_calls_seed.is_some())
+            {
+                test.gen_dict_snapshot = vm
+                    .generate_calls_context
+                    .as_ref()
+                    .map(|gc| gc.gen_dict.clone());
+            }
 
             output::print_worker_msg(
                 worker.worker_id,
@@ -315,6 +357,10 @@ pub fn check_tests_without_optimization_worker(
                 continue;
             }
 
+            let snapshot = executed_so_far
+                .iter()
+                .any(|t| t.generate_calls_seed.is_some())
+                .then(|| std::sync::Arc::new(worker.gen_dict.clone()));
             let test_updated = update_open_test(
                 &mut test,
                 executed_so_far.to_vec(),
@@ -322,6 +368,7 @@ pub fn check_tests_without_optimization_worker(
                 res,
                 worker.worker_id,
                 vm,
+                snapshot,
             );
 
             if test_updated && matches!(val, TestValue::BoolValue(false)) {
@@ -369,6 +416,15 @@ pub fn check_tests_without_optimization_worker(
                 test.result = res;
                 test.value = val;
                 test.worker_id = Some(worker.worker_id);
+                if executed_so_far
+                    .iter()
+                    .any(|t| t.generate_calls_seed.is_some())
+                {
+                    test.gen_dict_snapshot = vm
+                        .generate_calls_context
+                        .as_ref()
+                        .map(|gc| gc.gen_dict.clone());
+                }
 
                 output::print_worker_msg(
                     worker.worker_id,
@@ -449,6 +505,23 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
             }
 
             let is_optimization = matches!(deferred_kind, DeferredCheck::Optimization);
+            // Snapshot the dict iff any tx in the reproducer invoked
+            // vm.generateCalls(). Source the snapshot from the Arc pinned on
+            // `vm.generate_calls_context` (set once at sequence start) — NOT
+            // from `worker.gen_dict`, which drifts as each successful tx
+            // appends new calls. Using the live worker dict here breaks
+            // shrink-replay determinism: same seed + drifted dict → different
+            // generated calls → no candidate validates.
+            let snapshot = if executed_so_far
+                .iter()
+                .any(|t| t.generate_calls_seed.is_some())
+            {
+                vm.generate_calls_context
+                    .as_ref()
+                    .map(|gc| gc.gen_dict.clone())
+            } else {
+                None
+            };
             let test_updated = update_open_test(
                 &mut test,
                 executed_so_far.to_vec(),
@@ -456,6 +529,7 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
                 res,
                 worker.worker_id,
                 vm,
+                snapshot,
             );
 
             if test_updated {
@@ -528,6 +602,8 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
                                 value: alloy_primitives::U256::ZERO,
                                 gas: 12_500_000,
                                 delay: (0, 0),
+                                generate_calls_seed: None,
+                                generate_calls: Vec::new(),
                             };
                             let mut seq_with_test = test.reproducer.clone();
                             seq_with_test.push(opt_test_tx);
@@ -592,6 +668,15 @@ pub fn check_tests_after_tx_worker_with_checkpoint(
                 test.result = res;
                 test.value = val;
                 test.worker_id = Some(worker.worker_id);
+                if executed_so_far
+                    .iter()
+                    .any(|t| t.generate_calls_seed.is_some())
+                {
+                    test.gen_dict_snapshot = vm
+                        .generate_calls_context
+                        .as_ref()
+                        .map(|gc| gc.gen_dict.clone());
+                }
 
                 output::print_worker_msg(
                     worker.worker_id,

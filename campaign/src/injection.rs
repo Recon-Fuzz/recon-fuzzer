@@ -267,6 +267,8 @@ impl SequenceInjector {
             gasprice: U256::ZERO,
             value,
             delay: (delay[0], delay[1]),
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         })
     }
 
@@ -333,6 +335,8 @@ impl SequenceInjector {
             gasprice: U256::ZERO,
             value: U256::ZERO,
             delay: (delay[0], delay[1]),
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         })
     }
 

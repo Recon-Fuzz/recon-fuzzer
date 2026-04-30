@@ -93,6 +93,12 @@ pub struct EvmState {
     /// Branch mode only tracks JUMPI/JUMPDEST for faster execution
     pub coverage_mode: crate::coverage::CoverageMode,
 
+    /// Records captured from `vm.generateCalls()` invocations during the
+    /// most recent tx, in invocation order. Drained by the campaign after
+    /// each tx so the per-tx seed and per-invocation `n` can be stamped
+    /// onto the tx for deterministic shrink replay.
+    pub last_generate_calls_records: Vec<crate::types::GenerateCallRecord>,
+
     /// Set if the last tx (any frame, including reverted sub-calls) hit
     /// `Panic(0x01)` — solc 0.8+'s encoding of `assert(false)`. Populated
     /// from the inspector's nested-detection flag after tx execution.
@@ -101,17 +107,35 @@ pub struct EvmState {
     pub last_nested_invalid_fe: bool,
 
     /// Context for vm.generateCalls() cheatcode (on-demand generation)
-    /// Set by campaign layer before tx execution to enable reentrancy testing.
-    /// Contains: (fuzzable_functions, gen_dict, rng_seed). `gen_dict` is `Arc`
-    /// so wiring it into per-tx inspector setup is a refcount bump rather than
-    /// a deep clone — the dict can hold thousands of entries that grow over the
-    /// run, and cloning it on every tx accounted for ~70% of fuzzing throughput
-    /// drop in v0.4.10.
-    pub generate_calls_context: Option<(
-        Vec<(alloy_primitives::FixedBytes<4>, String, Vec<alloy_dyn_abi::DynSolType>)>,
-        std::sync::Arc<abi::types::GenDict>,
-        u64,
+    /// Set by the campaign layer before tx execution to enable reentrancy
+    /// testing via `vm.generateCalls()`. `gen_dict` is `Arc` so per-tx
+    /// wiring is a refcount bump (cloning it deeply on every tx caused a
+    /// ~70% throughput regression in v0.4.10).
+    ///
+    /// `return_masks` carries optional per-invocation keep-masks restored
+    /// from a failing reproducer's `Tx.generate_calls`. During fresh fuzz
+    /// the vec is empty (everything is returned); during shrink replay it
+    /// determines which subset of the deterministically-generated calls is
+    /// actually returned to the harness.
+    pub generate_calls_context: Option<GenerateCallsRunCtx>,
+}
+
+/// Per-tx context for `vm.generateCalls()`. The campaign layer builds this
+/// before each tx executes; the cheatcode reads from it to produce the
+/// same calls that the failing run did.
+#[derive(Debug, Clone)]
+pub struct GenerateCallsRunCtx {
+    pub fuzzable_functions: Vec<(
+        alloy_primitives::FixedBytes<4>,
+        String,
+        Vec<alloy_dyn_abi::DynSolType>,
     )>,
+    pub gen_dict: std::sync::Arc<abi::types::GenDict>,
+    pub rng_seed: u64,
+    /// Optional keep-mask per `vm.generateCalls()` invocation, indexed by
+    /// invocation ordinal within the tx. `None` for an index = "return all".
+    /// Empty vec = "no caller-supplied masks" (capture mode during fuzz).
+    pub return_masks: Vec<Option<Vec<bool>>>,
 }
 
 impl Default for EvmState {
@@ -138,6 +162,7 @@ impl EvmState {
             coverage_mode: crate::coverage::CoverageMode::Full,
             last_nested_panic_1: false,
             last_nested_invalid_fe: false,
+            last_generate_calls_records: Vec::new(),
             generate_calls_context: None,
         };
 
@@ -201,6 +226,7 @@ impl EvmState {
             coverage_mode: crate::coverage::CoverageMode::Full,
             last_nested_panic_1: false,
             last_nested_invalid_fe: false,
+            last_generate_calls_records: Vec::new(),
             generate_calls_context: None,
         };
 

@@ -393,8 +393,24 @@ impl EvmState {
         let value = tx.value;
         let gas_limit = tx.gas;
 
-        // Use cheatcode inspector to handle HEVM calls
+        // Use cheatcode inspector to handle HEVM calls.
         let mut inspector = crate::cheatcodes::CheatcodeInspector::new();
+
+        // Wire `generate_calls_context` from the VM into the inspector so
+        // shrink replays (which call exec_tx directly) reproduce the
+        // failing run's `vm.generateCalls()` byte-for-byte.
+        if let Some(gc) = &self.generate_calls_context {
+            use crate::cheatcodes::GenerateCallsContext;
+            inspector.generate_calls_ctx = Some(GenerateCallsContext {
+                fuzzable_functions: gc.fuzzable_functions.clone(),
+                gen_dict: gc.gen_dict.clone(),
+                rng_seed: gc.rng_seed,
+                call_count: 0,
+                call_index: 0,
+                return_masks: gc.return_masks.clone(),
+                captured_records: Vec::new(),
+            });
+        }
 
         // Use REVM's MainBuilder to create and execute with inspector
         let ctx = Context::mainnet()
@@ -437,6 +453,22 @@ impl EvmState {
 
         let execution_result = result_and_state.result;
         let tx_result = classify_execution_result(&execution_result);
+
+        // Propagate any-depth assertion-failure flags from the cheatcode
+        // inspector. Critical for shrink replays which call `exec_tx`
+        // directly — without this, `check_assertion` reads a stale flag
+        // and every shrink candidate is rejected.
+        self.last_nested_panic_1 = inspector.nested_panic_1;
+        self.last_nested_invalid_fe = inspector.nested_invalid_fe;
+
+        // Drain captured `vm.generateCalls()` records (used by capture-mode
+        // exec_tx callers and harmless for replay since the records mirror
+        // the masks they were given).
+        self.last_generate_calls_records = inspector
+            .generate_calls_ctx
+            .as_mut()
+            .map(|c| std::mem::take(&mut c.captured_records))
+            .unwrap_or_default();
 
         // Handle result and persistence
         if tx_result.is_revert() || tx_result.is_error() {
@@ -538,11 +570,12 @@ impl EvmState {
         // Wire `generate_calls_context` from the VM into the inspector so
         // `vm.generateCalls(...)` has the fuzzable-function table and seed
         // it needs to produce non-empty calldatas.
-        if let Some((fuzzable_funcs, gen_dict, rng_seed)) = &self.generate_calls_context {
+        if let Some(gc) = &self.generate_calls_context {
             inspector.set_generate_calls_context(
-                fuzzable_funcs.clone(),
-                gen_dict.clone(),
-                *rng_seed,
+                gc.fuzzable_functions.clone(),
+                gc.gen_dict.clone(),
+                gc.rng_seed,
+                gc.return_masks.clone(),
             );
         }
 
@@ -704,11 +737,12 @@ impl EvmState {
             crate::coverage::CombinedInspector::with_codehash_map(codehash_map.clone());
 
         // Set context for vm.generateCalls() cheatcode (on-demand reentrancy testing)
-        if let Some((fuzzable_funcs, gen_dict, rng_seed)) = &self.generate_calls_context {
+        if let Some(gc) = &self.generate_calls_context {
             inspector.set_generate_calls_context(
-                fuzzable_funcs.clone(),
-                gen_dict.clone(),
-                *rng_seed,
+                gc.fuzzable_functions.clone(),
+                gc.gen_dict.clone(),
+                gc.rng_seed,
+                gc.return_masks.clone(),
             );
         }
 
@@ -755,6 +789,16 @@ impl EvmState {
         // Detected cheaply per CALL frame in `Inspector::call_end`.
         self.last_nested_panic_1 = inspector.nested_panic_1;
         self.last_nested_invalid_fe = inspector.nested_invalid_fe;
+
+        // Drain captured `vm.generateCalls()` records so the campaign layer
+        // can stamp seed + records onto the failing reproducer's tx for
+        // deterministic shrink replay.
+        self.last_generate_calls_records = inspector
+            .cheatcode
+            .generate_calls_ctx
+            .as_mut()
+            .map(|c| std::mem::take(&mut c.captured_records))
+            .unwrap_or_default();
 
         let execution_result = result_and_state.result;
         let tx_result = classify_execution_result(&execution_result);
@@ -1168,13 +1212,16 @@ impl EvmState {
         let mut inspector = crate::coverage::TracingWithCheatcodes::new(tracing_config);
 
         // Set context for vm.generateCalls() cheatcode (for trace display of reentrancy)
-        if let Some((fuzzable_funcs, gen_dict, rng_seed)) = &self.generate_calls_context {
+        if let Some(gc) = &self.generate_calls_context {
             use crate::cheatcodes::GenerateCallsContext;
             inspector.cheatcode.generate_calls_ctx = Some(GenerateCallsContext {
-                fuzzable_functions: fuzzable_funcs.clone(),
-                gen_dict: gen_dict.clone(),
-                rng_seed: *rng_seed,
+                fuzzable_functions: gc.fuzzable_functions.clone(),
+                gen_dict: gc.gen_dict.clone(),
+                rng_seed: gc.rng_seed,
                 call_count: 0,
+                call_index: 0,
+                return_masks: gc.return_masks.clone(),
+                captured_records: Vec::new(),
             });
         }
 

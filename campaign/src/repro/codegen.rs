@@ -228,6 +228,8 @@ mod tests {
             gasprice: U256::ZERO,
             value: U256::ZERO,
             delay,
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         }
     }
 
@@ -375,6 +377,8 @@ mod tests {
             gasprice: U256::ZERO,
             value: U256::ZERO,
             delay: (3600, 10),
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         };
 
         let ctx = ReproContext {
@@ -402,6 +406,8 @@ mod tests {
             gasprice: U256::ZERO,
             value: U256::ZERO,
             delay: (0, 0),
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         };
 
         let ctx = ReproContext {

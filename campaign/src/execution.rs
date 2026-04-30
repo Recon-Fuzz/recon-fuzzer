@@ -725,13 +725,17 @@ pub fn execute_sequence_worker_with_checkpoints(
         })
         .max();
 
-    // Set context for vm.generateCalls() cheatcode (on-demand reentrancy
-    // testing). The cheatcode reads this from `vm.generate_calls_context`
-    // when handlers like `receive()` invoke `vmExt.generateCalls(n)` — without
-    // it, the cheatcode hands back an empty bytes[] and reentrancy patterns
-    // that depend on it become no-ops. See `execute_sequence_worker` for the
-    // mirror of this block (kept in sync intentionally).
-    if let Some(ref contract) = env.main_contract {
+    // Build the per-tx `vm.generateCalls()` cheatcode context. The fuzzable
+    // function table and dict snapshot are stable across the sequence; only
+    // the per-tx seed and (during shrink replay) per-tx return_masks change.
+    //
+    // For shrink-replay determinism we restore the seed from `tx.generate_calls_seed`
+    // and the per-invocation keep-masks from `tx.generate_calls`. For fresh
+    // fuzzing those fields are None/empty and we generate a random seed.
+    let gen_calls_setup: Option<(
+        Vec<(alloy_primitives::FixedBytes<4>, String, Vec<alloy_dyn_abi::DynSolType>)>,
+        std::sync::Arc<abi::types::GenDict>,
+    )> = if let Some(ref contract) = env.main_contract {
         let fuzzable = contract.fuzzable_functions(true);
         let fuzzable_funcs: Vec<_> = fuzzable
             .iter()
@@ -741,27 +745,61 @@ pub fn execute_sequence_worker_with_checkpoints(
                 (selector, f.name.clone(), param_types)
             })
             .collect();
-
-        if !fuzzable_funcs.is_empty() {
+        if fuzzable_funcs.is_empty() {
+            None
+        } else {
             // Snapshot the dict once per sequence into an `Arc` so each tx in
             // the sequence (and the inspector inside it) shares the same
             // immutable copy via refcount bump rather than deep-cloning.
-            vm.generate_calls_context = Some((
-                fuzzable_funcs,
-                std::sync::Arc::new(worker.gen_dict.clone()),
-                rand::random::<u64>(),
-            ));
+            // Shrink replay paths install the failing test's frozen dict
+            // snapshot directly onto `vm.generate_calls_context` instead.
+            let dict_arc = std::sync::Arc::new(worker.gen_dict.clone());
+            Some((fuzzable_funcs, dict_arc))
         }
-    }
+    } else {
+        None
+    };
 
     for tx in tx_seq {
+        // Per-tx wiring: pin the seed (restore for replay, fresh for fuzz)
+        // and restore any per-invocation keep-masks captured during the
+        // failing run.
+        let tx_seed = if let Some((funcs, dict)) = &gen_calls_setup {
+            let seed = tx.generate_calls_seed.unwrap_or_else(rand::random::<u64>);
+            let masks: Vec<Option<Vec<bool>>> = tx
+                .generate_calls
+                .iter()
+                .map(|r| r.keep_mask.clone())
+                .collect();
+            vm.generate_calls_context = Some(evm::exec::GenerateCallsRunCtx {
+                fuzzable_functions: funcs.clone(),
+                gen_dict: dict.clone(),
+                rng_seed: seed,
+                return_masks: masks,
+            });
+            Some(seed)
+        } else {
+            vm.generate_calls_context = None;
+            None
+        };
+
         let (result, local_cov) =
             vm.exec_tx_check_new_cov(
                 tx,
                 &env.coverage_ref_runtime,
                 &env.codehash_map,
             )?;
-        executed_so_far.push(tx.clone());
+
+        // Build the recorded version of this tx: stamp on the captured
+        // generateCalls records (and seed) IFF the tx didn't already
+        // carry them (i.e., we're in fresh-fuzz mode, not replay).
+        let mut recorded = tx.clone();
+        let captured = std::mem::take(&mut vm.last_generate_calls_records);
+        if !captured.is_empty() && recorded.generate_calls_seed.is_none() {
+            recorded.generate_calls_seed = tx_seed;
+            recorded.generate_calls = captured;
+        }
+        executed_so_far.push(recorded);
 
         if local_cov {
             new_coverage = true;
@@ -882,9 +920,13 @@ pub fn execute_sequence_worker(
         matches!(t.read().test_type, crate::testing::TestType::OptimizationTest { .. })
     });
 
-    // Set context for vm.generateCalls() cheatcode (on-demand reentrancy testing)
-    // The cheatcode will call gen_abi_call_m directly for identical behavior to main fuzzer
-    if let Some(ref contract) = env.main_contract {
+    // Build the per-tx `vm.generateCalls()` cheatcode context. See
+    // `execute_sequence_worker_with_checkpoints` for the full explanation;
+    // this is the parallel block kept in sync.
+    let gen_calls_setup: Option<(
+        Vec<(alloy_primitives::FixedBytes<4>, String, Vec<alloy_dyn_abi::DynSolType>)>,
+        std::sync::Arc<abi::types::GenDict>,
+    )> = if let Some(ref contract) = env.main_contract {
         let fuzzable = contract.fuzzable_functions(true); // mutable only for reentrancy
         let fuzzable_funcs: Vec<_> = fuzzable
             .iter()
@@ -894,20 +936,39 @@ pub fn execute_sequence_worker(
                 (selector, f.name.clone(), param_types)
             })
             .collect();
-
-        if !fuzzable_funcs.is_empty() {
-            // Snapshot the dict once per sequence into an `Arc` so each tx in
-            // the sequence (and the inspector inside it) shares the same
-            // immutable copy via refcount bump rather than deep-cloning.
-            vm.generate_calls_context = Some((
-                fuzzable_funcs,
-                std::sync::Arc::new(worker.gen_dict.clone()),
-                rand::random::<u64>(), // Random seed for this sequence
-            ));
+        if fuzzable_funcs.is_empty() {
+            None
+        } else {
+            let dict_arc = std::sync::Arc::new(worker.gen_dict.clone());
+            Some((fuzzable_funcs, dict_arc))
         }
-    }
+    } else {
+        None
+    };
 
     for tx in tx_seq {
+        // Per-tx wiring: pin the seed (restore for replay, fresh for fuzz)
+        // and restore any per-invocation keep-masks captured during the
+        // failing run.
+        let tx_seed = if let Some((funcs, dict)) = &gen_calls_setup {
+            let seed = tx.generate_calls_seed.unwrap_or_else(rand::random::<u64>);
+            let masks: Vec<Option<Vec<bool>>> = tx
+                .generate_calls
+                .iter()
+                .map(|r| r.keep_mask.clone())
+                .collect();
+            vm.generate_calls_context = Some(evm::exec::GenerateCallsRunCtx {
+                fuzzable_functions: funcs.clone(),
+                gen_dict: dict.clone(),
+                rng_seed: seed,
+                return_masks: masks,
+            });
+            Some(seed)
+        } else {
+            vm.generate_calls_context = None;
+            None
+        };
+
         // Execute with local coverage tracking
         let (result, local_cov) = vm.exec_tx_check_new_cov(
             tx,
@@ -915,7 +976,14 @@ pub fn execute_sequence_worker(
             &env.codehash_map,
         )?;
 
-        executed_so_far.push(tx.clone());
+        // Build the recorded version of this tx (stamp captured records).
+        let mut recorded = tx.clone();
+        let captured = std::mem::take(&mut vm.last_generate_calls_records);
+        if !captured.is_empty() && recorded.generate_calls_seed.is_none() {
+            recorded.generate_calls_seed = tx_seed;
+            recorded.generate_calls = captured;
+        }
+        executed_so_far.push(recorded);
 
         if local_cov {
             new_coverage = true;

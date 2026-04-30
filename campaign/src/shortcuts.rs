@@ -160,6 +160,8 @@ fn captured_calls_to_tx_sequence(
                 gasprice: U256::ZERO,
                 value: call.value,
                 delay: (0, 0),
+                generate_calls_seed: None,
+                generate_calls: Vec::new(),
             }
         })
         .collect()

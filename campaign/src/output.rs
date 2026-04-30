@@ -49,6 +49,82 @@ pub fn format_call_sequence(txs: &[Tx], contract_name: &str) -> Vec<String> {
     txs.iter().map(|tx| format_tx(tx, contract_name)).collect()
 }
 
+/// Format the `vm.generateCalls()` invocations recorded during a tx into
+/// human-readable annotation lines. Returns lines per invocation; if
+/// `decode_with` is `Some((gen_dict, fuzzable_functions, contract_name))`,
+/// each kept call is also regenerated and decoded as
+/// `ContractName.fn(args)` so the user sees exactly what the harness
+/// invoked. Otherwise only the seed and indices are shown.
+pub fn format_generate_calls(
+    tx: &Tx,
+    decode_with: Option<(
+        &std::sync::Arc<abi::types::GenDict>,
+        &[(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )],
+        &str,
+    )>,
+) -> Vec<String> {
+    if tx.generate_calls.is_empty() {
+        return Vec::new();
+    }
+    let seed = tx.generate_calls_seed.unwrap_or(0);
+    let mut lines = Vec::new();
+    let mut call_count_so_far: usize = 0;
+    for (i, rec) in tx.generate_calls.iter().enumerate() {
+        let header = match &rec.keep_mask {
+            Some(mask) => {
+                let kept: Vec<usize> = mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, b)| if *b { Some(j) } else { None })
+                    .collect();
+                format!(
+                    "  vm.generateCalls(#{}): kept {} of {} (seed=0x{:016x}, indices={:?})",
+                    i,
+                    kept.len(),
+                    rec.n,
+                    seed,
+                    kept
+                )
+            }
+            None => format!(
+                "  vm.generateCalls(#{}): kept all {} (seed=0x{:016x})",
+                i, rec.n, seed
+            ),
+        };
+        lines.push(header);
+
+        if let Some((dict, fuzzable, cname)) = decode_with {
+            // Regenerate using the same per-invocation seed the cheatcode would.
+            let inv_seed = seed.wrapping_add(call_count_so_far as u64);
+            let kept = evm::cheatcodes::CheatcodeInspector::regenerate_kept_calls(
+                inv_seed,
+                rec.n,
+                rec.keep_mask.as_ref(),
+                dict,
+                fuzzable,
+            );
+            for (j, name, args) in kept {
+                let args_str: Vec<String> = args.iter().map(format_sol_value).collect();
+                lines.push(format!(
+                    "    [#{}] {}.{}({})",
+                    j,
+                    cname,
+                    name,
+                    args_str.join(", ")
+                ));
+            }
+        }
+        // Cheatcode advances call_count by full requested count, so seeds
+        // for subsequent invocations align even when masks dropped calls.
+        call_count_so_far += rec.n;
+    }
+    lines
+}
+
 /// Multi-contract variant of `format_tx`. Resolves the contract name per-tx
 /// from `tx.dst → deployed_addresses`, falling back to `fallback_name` if the
 /// destination isn't in the deployed list.
@@ -197,6 +273,12 @@ pub fn print_test_failure(worker_id: usize, test_name: &str, txs: &[Tx], contrac
     println!("  Call sequence:");
     for tx in txs {
         println!("{}", format_tx(tx, contract_name));
+        // No dict snapshot or main contract available here — emit the
+        // seed/indices header without decoded bodies. Callers that have
+        // both can use `format_generate_calls(..., Some((..)))` directly.
+        for line in format_generate_calls(tx, None) {
+            println!("{}", line);
+        }
     }
 }
 
@@ -380,6 +462,7 @@ pub fn print_traces(
     contracts: &[CompiledContract],
     deployed_addresses: &[(Address, String)],
     main_contract: Option<&CompiledContract>,
+    gen_dict_snapshot: Option<&std::sync::Arc<abi::types::GenDict>>,
 ) {
     // StdoutWriter forwards `fmt::Write` calls to `println!`/`print!`.
     struct StdoutWriter;
@@ -400,6 +483,7 @@ pub fn print_traces(
         contracts,
         deployed_addresses,
         main_contract,
+        gen_dict_snapshot,
     );
 }
 
@@ -419,11 +503,24 @@ pub fn write_traces(
     contracts: &[CompiledContract],
     deployed_addresses: &[(Address, String)],
     main_contract: Option<&CompiledContract>,
+    gen_dict_snapshot: Option<&std::sync::Arc<abi::types::GenDict>>,
 ) -> std::fmt::Result {
     use alloy_primitives::keccak256;
 
-    // Set up generate_calls context for reentrancy tracing if main contract is provided
-    if let Some(contract) = main_contract {
+    // Build the per-tx generateCalls cheatcode context for trace replay.
+    // Per-tx wiring (inside the loop below) restores `tx.generate_calls_seed`
+    // and `tx.generate_calls[*].keep_mask` so the trace shows exactly the
+    // calls the failing run saw — including only the kept subset after
+    // inner-batch shrink. Falls back to a fresh dict + dummy seed if no
+    // snapshot was provided.
+    let trace_gen_calls_ctx: Option<(
+        Vec<(
+            alloy_primitives::FixedBytes<4>,
+            String,
+            Vec<alloy_dyn_abi::DynSolType>,
+        )>,
+        std::sync::Arc<abi::types::GenDict>,
+    )> = main_contract.and_then(|contract| {
         let fuzzable = contract.fuzzable_functions(true);
         let fuzzable_funcs: Vec<_> = fuzzable
             .iter()
@@ -433,14 +530,15 @@ pub fn write_traces(
                 (selector, f.name.clone(), param_types)
             })
             .collect();
-
-        if !fuzzable_funcs.is_empty() {
-            // Use a fixed seed for reproducible trace replay (different from original)
-            // Note: This means reentrancy calls in traces may differ from actual execution
-            let gen_dict = std::sync::Arc::new(abi::types::GenDict::new(0xDEADBEEF));
-            vm.generate_calls_context = Some((fuzzable_funcs, gen_dict, 0x12345678));
+        if fuzzable_funcs.is_empty() {
+            None
+        } else {
+            let dict = gen_dict_snapshot
+                .cloned()
+                .unwrap_or_else(|| std::sync::Arc::new(abi::types::GenDict::new(0xDEADBEEF)));
+            Some((fuzzable_funcs, dict))
         }
-    }
+    });
 
     writeln!(out, "Traces:")?;
 
@@ -498,6 +596,28 @@ pub fn write_traces(
         };
 
         writeln!(out, "  [{}] {} from: {}", i, func_info, sender_str)?;
+
+        // Per-tx wiring of the generateCalls context: restore the failing
+        // run's seed and per-invocation keep-masks so traces reflect the
+        // shrunk subset of calls. Clears the context for txs that didn't
+        // invoke the cheatcode so a previous tx's wiring doesn't leak.
+        if let Some((funcs, dict)) = &trace_gen_calls_ctx {
+            if let Some(seed) = tx.generate_calls_seed {
+                let masks: Vec<Option<Vec<bool>>> = tx
+                    .generate_calls
+                    .iter()
+                    .map(|r| r.keep_mask.clone())
+                    .collect();
+                vm.generate_calls_context = Some(evm::exec::GenerateCallsRunCtx {
+                    fuzzable_functions: funcs.clone(),
+                    gen_dict: dict.clone(),
+                    rng_seed: seed,
+                    return_masks: masks,
+                });
+            } else {
+                vm.generate_calls_context = None;
+            }
+        }
 
         // Execute with revm-inspectors TracingInspector
         match vm.exec_tx_with_revm_tracing(tx) {

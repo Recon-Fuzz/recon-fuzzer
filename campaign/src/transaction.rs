@@ -287,6 +287,8 @@ pub fn gen_tx_from_template<R: Rng>(
         gasprice: tx_conf.max_gasprice,
         value,
         delay,
+        generate_calls_seed: None,
+        generate_calls: Vec::new(),
     })
 }
 
@@ -536,6 +538,8 @@ pub fn gen_tx_smart<R: Rng>(
         gasprice: tx_conf.max_gasprice,
         value,
         delay,
+        generate_calls_seed: None,
+        generate_calls: Vec::new(),
     })
 }
 
@@ -597,6 +601,8 @@ pub fn gen_tx<R: Rng>(
         gasprice: tx_conf.max_gasprice,
         value,
         delay,
+        generate_calls_seed: None,
+        generate_calls: Vec::new(),
     })
 }
 
@@ -661,6 +667,8 @@ pub fn gen_tx_with_cached_fuzzable<R: Rng>(
         gasprice: tx_conf.max_gasprice,
         value,
         delay,
+        generate_calls_seed: None,
+        generate_calls: Vec::new(),
     })
 }
 
@@ -718,6 +726,8 @@ pub fn gen_tx_with_cached_fuzzable_simple<R: Rng>(
         gasprice: tx_conf.max_gasprice,
         value,
         delay,
+        generate_calls_seed: None,
+        generate_calls: Vec::new(),
     })
 }
 
@@ -933,6 +943,9 @@ fn remove_call_tx(tx: &Tx) -> Tx {
         gasprice: U256::ZERO, // NoCall tx doesn't need gas
         value: U256::ZERO,
         delay: tx.delay,
+        // Replacing with a NoCall makes generate_calls metadata meaningless.
+        generate_calls_seed: None,
+        generate_calls: Vec::new(),
     }
 }
 

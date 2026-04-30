@@ -198,6 +198,8 @@ mod evm_tests {
             gasprice: U256::ZERO,
             value: U256::ZERO,
             delay: (0, 0),
+            generate_calls_seed: None,
+            generate_calls: Vec::new(),
         };
 
         let result = vm.exec_tx(&tx);

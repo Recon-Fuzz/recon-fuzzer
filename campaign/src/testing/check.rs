@@ -288,7 +288,15 @@ pub fn check_assertion(
     }
 }
 
-/// Update a test based on the result of checking it
+/// Update a test based on the result of checking it.
+///
+/// `gen_dict_snapshot` is the worker's `gen_dict` wrapped in an `Arc` at
+/// failure time; it's stored on the test so shrink replays can re-run
+/// `vm.generateCalls()` against the exact same dict that produced the
+/// failure (otherwise the dict drifts as the campaign continues, breaking
+/// determinism). Pass `None` for tests that don't involve the cheatcode
+/// (no harm — the snapshot is only consulted when the reproducer's tx
+/// has a `generate_calls_seed`).
 pub fn update_open_test(
     test: &mut EchidnaTest,
     reproducer: Vec<Tx>,
@@ -296,6 +304,7 @@ pub fn update_open_test(
     result: TxResult,
     worker_id: usize,
     _vm: &EvmState, // Note: We don't store VM - shrinking uses initial_vm
+    gen_dict_snapshot: Option<std::sync::Arc<abi::types::GenDict>>,
 ) -> bool {
     if !test.is_open() {
         return false;
@@ -309,6 +318,7 @@ pub fn update_open_test(
             test.result = result;
             test.value = test_value;
             test.worker_id = Some(worker_id);
+            test.gen_dict_snapshot = gen_dict_snapshot;
             // Note: We don't store test.vm here - shrinking uses initial_vm
             true
         }
@@ -322,6 +332,7 @@ pub fn update_open_test(
             test.reproducer = reproducer;
             test.result = result;
             test.value = test_value;
+            test.gen_dict_snapshot = gen_dict_snapshot;
             // Note: We don't store test.vm here - shrinking uses initial_vm
             // State stays Open - closeOptimizationTest will set Large(0) after limit
             // worker_id is NOT set - all workers can continue optimizing!
