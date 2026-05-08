@@ -650,6 +650,14 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
 
     info!("Fuzzing contract: {}", main_contract.name);
 
+    // Snapshot of `out/build-info/` taken AFTER slither runs (success or
+    // failure path) so coverage reports read from a frozen copy rather
+    // than the live `out/` directory. A concurrent `forge build` during
+    // the campaign would otherwise corrupt the final report.
+    // `snapshot_build_info` wipes any prior snapshot dir on each call,
+    // so this also cleans up stale snapshots from previous runs.
+    let mut build_info_snapshot_dir: Option<PathBuf> = None;
+
     // Load slither/recon-generate info for source analysis 
     // This provides precise constants from source code analysis
     let project_path = args.project.to_string_lossy();
@@ -770,6 +778,19 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         }
     };
 
+    // Snapshot `out/build-info/` after slither has run (both success and
+    // failure paths converge here). Coverage reports — final and any
+    // periodic LCOV writes — read from this frozen copy instead of the
+    // live dir, so a concurrent `forge build` during the campaign can't
+    // corrupt them. `snapshot_build_info` wipes any prior snapshot on
+    // each call, so this also cleans up stale dirs from previous runs.
+    if let Some(corpus_dir) = config.campaign_conf.corpus_dir.as_ref() {
+        match evm::coverage::snapshot_build_info(&args.project, corpus_dir) {
+            Ok(snap) => build_info_snapshot_dir = snap,
+            Err(e) => warn!("Failed to snapshot build-info: {}", e),
+        }
+    }
+
     // Set exclude_from_fuzzing from slither info if available
     if let Some(ref info) = slither_info {
         let excluded = info.get_excluded_functions();
@@ -864,6 +885,7 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     let mut env = Env::new(config, project.contracts.clone());
     env.main_contract = Some(main_contract.clone());
     env.slither_info = slither_info;
+    env.build_info_snapshot_dir = build_info_snapshot_dir;
 
     // Set up --repro writer if specified
     if let Some(ref repro_path) = args.repro {
@@ -1515,6 +1537,7 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
             &runtime_cov,
             &env.contracts,
             corpus_dir,
+            env.build_info_snapshot_dir.as_deref(),
         ) {
             Ok((lcov_path, html_path)) => {
                 info!("Saved LCOV coverage report to {:?}", lcov_path);
@@ -2004,14 +2027,21 @@ fn generate_coverage_reports(
     runtime_coverage: &evm::exec::CoverageMap,
     contracts: &[evm::foundry::CompiledContract],
     corpus_dir: &std::path::Path,
+    snapshot_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
     use evm::coverage::{
         build_codehash_to_source_info, build_init_codehash_to_source_info,
-        generate_source_coverage_multi, load_source_info, save_html_report, save_lcov_report,
+        generate_source_coverage_multi, load_source_info, load_source_info_from,
+        save_html_report, save_lcov_report,
     };
 
     // Load source file information (per-build-info file-id remap is built here).
-    let source_index = load_source_info(project_path)?;
+    // Prefer the snapshot taken at campaign start so a concurrent
+    // `forge build` during the run can't corrupt the report.
+    let source_index = match snapshot_dir {
+        Some(dir) => load_source_info_from(dir, project_path)?,
+        None => load_source_info(project_path)?,
+    };
     let source_files = &source_index.source_files;
 
     // Build codehash -> source info maps for runtime and init code.

@@ -105,6 +105,12 @@ pub struct Env {
 
     /// Foundry repro writer (--repro flag)
     pub repro_writer: Option<ReproWriter>,
+
+    /// Snapshot of `out/build-info/` taken at campaign start. Coverage
+    /// reports read from here so a concurrent `forge build` during the
+    /// run can't corrupt the final report. `None` if no build-info was
+    /// available at startup; callers fall back to the live directory.
+    pub build_info_snapshot_dir: Option<std::path::PathBuf>,
 }
 
 impl Env {
@@ -152,6 +158,7 @@ impl Env {
             fuzz_templates: Arc::new(RwLock::new(Vec::new())),
             web_state: None,
             repro_writer: None,
+            build_info_snapshot_dir: None,
         }
     }
 
