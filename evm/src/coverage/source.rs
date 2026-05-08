@@ -680,21 +680,91 @@ impl SourceInfoIndex {
 /// current artifact references, polluting the global remap.
 const BUILD_INFO_FRESH_WINDOW_SECS: u64 = 30;
 
+/// Snapshot every `*.json` from `project_path/out/build-info/` into a
+/// subdirectory of the corpus dir, so a concurrent `forge build` during
+/// the fuzzing campaign can't corrupt the final coverage report.
+///
+/// Returns the snapshot directory. Returns `Ok(None)` if the project has
+/// no build-info dir or it's empty (campaign falls back to the live
+/// directory, same as before this snapshot infrastructure).
+///
+/// The snapshot lives under `<corpus_dir>/build-snapshot/`. We blow away
+/// any prior contents on each run so stale build-infos from previous
+/// campaigns don't accumulate.
+pub fn snapshot_build_info(project_path: &Path, corpus_dir: &Path) -> Result<Option<PathBuf>> {
+    let dest = corpus_dir.join("build-snapshot");
+
+    // Always wipe any prior snapshot first — even if the source dir is
+    // missing this run, a stale snapshot from a previous run must not
+    // be silently used by coverage rendering.
+    if dest.exists() {
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    let src = project_path.join("out").join("build-info");
+    if !src.exists() {
+        return Ok(None);
+    }
+    fs::create_dir_all(&dest)?;
+
+    let mut copied = 0usize;
+    for entry in fs::read_dir(&src)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().map_or(false, |e| e == "json") {
+            if let Some(name) = p.file_name() {
+                let dest_path = dest.join(name);
+                if let Err(e) = fs::copy(&p, &dest_path) {
+                    // Best-effort: skip files we can't copy (race with delete?).
+                    tracing::warn!(
+                        "snapshot_build_info: failed to copy {}: {}",
+                        p.display(),
+                        e
+                    );
+                    continue;
+                }
+                copied += 1;
+            }
+        }
+    }
+    if copied == 0 {
+        // Empty source dir — clean up our empty snapshot dir and return None
+        // so callers know to skip.
+        let _ = fs::remove_dir_all(&dest);
+        return Ok(None);
+    }
+    tracing::info!(
+        "Snapshotted {} build-info file(s) to {} (coverage reports read from here so a concurrent `forge build` can't corrupt them)",
+        copied,
+        dest.display()
+    );
+    Ok(Some(dest))
+}
+
 /// Load source coverage data from a Foundry project.
 ///
-/// Reads every recent `out/build-info/*.json` independently, assigns
-/// globally-unique file ids by source path, and records a per-build-info
-/// `local_id → global_id` remap. Source maps in contract artifacts use ids
-/// local to their build-info, so callers must remap them via
-/// [`SourceInfoIndex::remap_for_contract`] before indexing into `source_files`.
-///
-/// Build-info files are filtered to those whose mtime is within
-/// [`BUILD_INFO_FRESH_WINDOW_SECS`] of the newest one — this drops stale
-/// build-info JSONs from older compiles that no current artifact references.
+/// See [`load_source_info_from`] for the full description; this is the
+/// convenience wrapper that uses `project_path/out/build-info/` as the
+/// build-info source. Callers that have stashed a snapshot copy of the
+/// build-info elsewhere (to defend against `forge build` racing with the
+/// running campaign) should use [`load_source_info_from`] instead.
 pub fn load_source_info(project_path: &Path) -> Result<SourceInfoIndex> {
-    let out_dir = project_path.join("out");
-    let build_info_dir = out_dir.join("build-info");
+    let build_info_dir = project_path.join("out").join("build-info");
+    load_source_info_from(&build_info_dir, project_path)
+}
 
+/// Same as [`load_source_info`] but reads build-info JSONs from
+/// `build_info_dir` rather than `project_path/out/build-info`. Source files
+/// referenced inside the build-info are still resolved relative to
+/// `project_path` (their absolute paths haven't changed).
+///
+/// Use this with a snapshot directory so a concurrent `forge build` during
+/// the fuzzing campaign can't corrupt the final coverage report — snapshot
+/// the build-info at startup, then read from the snapshot at campaign end.
+pub fn load_source_info_from(
+    build_info_dir: &Path,
+    project_path: &Path,
+) -> Result<SourceInfoIndex> {
     let mut index = SourceInfoIndex::empty();
 
     if !build_info_dir.exists() {
@@ -704,7 +774,7 @@ pub fn load_source_info(project_path: &Path) -> Result<SourceInfoIndex> {
     let mut next_global: i32 = 0;
 
     // Collect (path, mtime) for every build-info JSON.
-    let mut paths_with_mtime: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(&build_info_dir)?
+    let mut paths_with_mtime: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(build_info_dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |e| e == "json"))

@@ -217,8 +217,14 @@ impl WebObservableState {
         // Load source files by ID for line coverage. The index also carries the
         // per-build-info file-id remap that codehash_to_source_info needs to
         // produce correct mappings when multiple build-info JSONs coexist.
+        // Prefer the snapshot taken at campaign start so a concurrent
+        // `forge build` during the run can't corrupt the report.
         let project_path = std::env::current_dir().unwrap_or_default();
-        let source_index = evm::coverage::load_source_info(&project_path)
+        let load_result = match env.build_info_snapshot_dir.as_deref() {
+            Some(dir) => evm::coverage::load_source_info_from(dir, &project_path),
+            None => evm::coverage::load_source_info(&project_path),
+        };
+        let source_index = load_result
             .unwrap_or_else(|_| evm::coverage::SourceInfoIndex::empty());
         let source_files_by_id = source_index.source_files.clone();
 

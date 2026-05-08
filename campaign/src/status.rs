@@ -65,7 +65,13 @@ pub fn write_lcov_info_worker(env: &WorkerEnv) {
 
     // Load source files (this is cached internally, so reasonably fast).
     // The index also carries the per-build-info file-id remap.
-    let source_index = match load_source_info(&env.project_path) {
+    // Prefer the snapshot taken at campaign start so a concurrent
+    // `forge build` during the run can't corrupt the report.
+    let load_result = match env.build_info_snapshot_dir.as_deref() {
+        Some(dir) => evm::coverage::load_source_info_from(dir, &env.project_path),
+        None => load_source_info(&env.project_path),
+    };
+    let source_index = match load_result {
         Ok(info) => info,
         Err(e) => {
             tracing::warn!("Failed to load source info for lcov: {}", e);

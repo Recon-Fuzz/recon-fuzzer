@@ -59,6 +59,8 @@ pub struct WorkerEnv {
     pub setup_dict_tuples: Vec<alloy_dyn_abi::DynSolValue>,
     /// Foundry repro writer (--repro flag)
     pub repro_writer: Option<ReproWriter>,
+    /// Snapshot of `out/build-info/` taken at campaign start. See `Env`.
+    pub build_info_snapshot_dir: Option<std::path::PathBuf>,
 }
 
 impl From<&Env> for WorkerEnv {
@@ -88,6 +90,7 @@ impl From<&Env> for WorkerEnv {
             setup_dict_signed: env.setup_dict_signed.clone(),
             setup_dict_tuples: env.setup_dict_tuples.clone(),
             repro_writer: env.repro_writer.clone(),
+            build_info_snapshot_dir: env.build_info_snapshot_dir.clone(),
         }
     }
 }
