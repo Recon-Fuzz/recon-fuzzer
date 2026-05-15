@@ -3,6 +3,7 @@
 //! Contains nonce management, funding, code setting, and result queries.
 
 use alloy_primitives::{Address, Bytes, B256, U256};
+use rustc_hash::FxHashSet;
 use revm::bytecode::Bytecode;
 use revm::context_interface::result::{ExecutionResult, Output};
 use revm::state::AccountInfo;
@@ -148,7 +149,7 @@ impl EvmState {
 
     /// Get the PCs touched during the last transaction execution
     /// Returns (codehash, pc) pairs for all branches hit
-    pub fn get_last_touched_pcs(&self) -> &std::collections::HashSet<(B256, usize)> {
+    pub fn get_last_touched_pcs(&self) -> &FxHashSet<(B256, usize)> {
         &self.last_touched_pcs
     }
 

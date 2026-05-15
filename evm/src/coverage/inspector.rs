@@ -13,6 +13,7 @@ use revm::{
     Inspector,
 };
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -1108,7 +1109,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedIn
 /// Coverage map type: Codehash -> PC -> (StackBits, ResultBits)
 /// Using codehash (keccak256 of bytecode) instead of address ensures
 /// the same contract deployed to different addresses is tracked once
-pub type CoverageMap = HashMap<B256, HashMap<usize, (u64, u64)>>;
+pub type CoverageMap = FxHashMap<B256, FxHashMap<usize, (u64, u64)>>;
 
 /// Calculate coverage statistics
 /// Returns (points, numCodehashes)
@@ -1397,8 +1398,8 @@ mod tests {
 
     #[test]
     fn test_coverage_stats_empty() {
-        let init: CoverageMap = HashMap::new();
-        let runtime: CoverageMap = HashMap::new();
+        let init: CoverageMap = Default::default();
+        let runtime: CoverageMap = Default::default();
 
         let (points, codehashes) = coverage_stats(&init, &runtime);
         assert_eq!(points, 0);
@@ -1407,21 +1408,21 @@ mod tests {
 
     #[test]
     fn test_coverage_stats_combined() {
-        let mut init: CoverageMap = HashMap::new();
-        let mut runtime: CoverageMap = HashMap::new();
+        let mut init: CoverageMap = Default::default();
+        let mut runtime: CoverageMap = Default::default();
 
         let codehash1 = B256::repeat_byte(0x01);
         let codehash2 = B256::repeat_byte(0x02);
 
         // Init coverage: codehash1 with 3 PCs
-        let mut pcs1 = HashMap::new();
+        let mut pcs1 = FxHashMap::default();
         pcs1.insert(10, (1u64, 1u64));
         pcs1.insert(20, (1u64, 1u64));
         pcs1.insert(30, (1u64, 1u64));
         init.insert(codehash1, pcs1);
 
         // Runtime coverage: codehash2 with 2 PCs
-        let mut pcs2 = HashMap::new();
+        let mut pcs2 = FxHashMap::default();
         pcs2.insert(100, (1u64, 1u64));
         pcs2.insert(200, (1u64, 1u64));
         runtime.insert(codehash2, pcs2);
@@ -1433,10 +1434,10 @@ mod tests {
 
     #[test]
     fn test_coverage_points() {
-        let mut coverage: CoverageMap = HashMap::new();
+        let mut coverage: CoverageMap = Default::default();
 
         let codehash = B256::repeat_byte(0x01);
-        let mut pcs = HashMap::new();
+        let mut pcs = FxHashMap::default();
         pcs.insert(10, (1u64, 1u64));
         pcs.insert(20, (1u64, 1u64));
         coverage.insert(codehash, pcs);
@@ -1446,11 +1447,11 @@ mod tests {
 
     #[test]
     fn test_num_codehashes() {
-        let mut coverage: CoverageMap = HashMap::new();
+        let mut coverage: CoverageMap = Default::default();
 
-        coverage.insert(B256::repeat_byte(0x01), HashMap::new());
-        coverage.insert(B256::repeat_byte(0x02), HashMap::new());
-        coverage.insert(B256::repeat_byte(0x03), HashMap::new());
+        coverage.insert(B256::repeat_byte(0x01), FxHashMap::default());
+        coverage.insert(B256::repeat_byte(0x02), FxHashMap::default());
+        coverage.insert(B256::repeat_byte(0x03), FxHashMap::default());
 
         assert_eq!(num_codehashes(&coverage), 3);
     }

@@ -7,6 +7,7 @@ use revm::bytecode::Bytecode;
 use revm::context_interface::result::{ExecutionResult, Output};
 use revm::state::AccountInfo;
 use revm::{Context, Database, DatabaseCommit, InspectEvm, MainBuilder, MainContext};
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
 use crate::types::{Tx, TxCall, TxResult};
@@ -155,7 +156,7 @@ impl EvmState {
         if !pc_counter.touched.is_empty() {
             let mut coverage = coverage_ref.write();
             for &(codehash, pc, depth) in &pc_counter.touched {
-                let contract_cov = coverage.entry(codehash).or_insert_with(HashMap::new);
+                let contract_cov = coverage.entry(codehash).or_insert_with(FxHashMap::default);
                 let depth_bit = if depth < 64 { 1u64 << depth } else { 1u64 << 63 };
                 let entry = contract_cov.entry(pc).or_insert((0, 0));
                 entry.0 |= depth_bit;
@@ -659,7 +660,7 @@ impl EvmState {
         let result_bit = 1 << tx_result.to_bit_index();
 
         for (addr, pc, stack_depth) in inspector.touched {
-            let contract_cov = coverage.entry(addr).or_insert_with(HashMap::new);
+            let contract_cov = coverage.entry(addr).or_insert_with(FxHashMap::default);
             let entry = contract_cov.entry(pc).or_insert((0, 0));
 
             // Update stack depth bits
@@ -902,7 +903,7 @@ impl EvmState {
                 let mut coverage = coverage_ref.write();
 
                 for (idx, &(codehash, pc, stack_depth)) in inspector.touched.iter().enumerate() {
-                    let contract_cov = coverage.entry(codehash).or_insert_with(HashMap::new);
+                    let contract_cov = coverage.entry(codehash).or_insert_with(FxHashMap::default);
 
                     let depth_bit = if stack_depth < 64 {
                         1u64 << stack_depth

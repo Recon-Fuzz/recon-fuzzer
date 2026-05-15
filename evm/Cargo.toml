@@ -43,3 +43,8 @@ scraper = { version = "0.20", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "execution"
+harness = false
