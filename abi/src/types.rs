@@ -342,6 +342,12 @@ impl GenDict {
     
     /// Add a numeric constant and its variants to the dictionary
     pub fn add_numeric_constant(&mut self, n: i128) {
+        // Skip if base value already known — variants were generated on first insertion
+        if let Ok(base) = I256::try_from(n) {
+            if self.signed_dict_values.contains(&base) {
+                return;
+            }
+        }
         let variants = Self::make_num_values(n);
         for val in variants {
             self.signed_dict_values.insert(val);

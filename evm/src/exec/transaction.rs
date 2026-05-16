@@ -1139,7 +1139,7 @@ impl EvmState {
             TxResult,
             revm_inspectors::tracing::CallTraceArena,
             Vec<(Address, U256, U256, U256)>,
-            HashMap<(Address, U256), U256>,
+            FxHashMap<(Address, U256), U256>,
             Bytes,
             Vec<revm::primitives::Log>,
             Vec<(alloy_primitives::B256, usize)>, // PCs hit: (codehash, pc) for solver tracking
@@ -1168,7 +1168,7 @@ impl EvmState {
                 TxResult::Stop,
                 revm_inspectors::tracing::CallTraceArena::default(),
                 vec![],
-                HashMap::new(),
+                FxHashMap::default(),
                 Bytes::new(),
                 vec![],
                 vec![], // No PCs hit for NoCall

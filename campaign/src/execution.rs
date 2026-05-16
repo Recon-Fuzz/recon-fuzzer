@@ -21,11 +21,7 @@ use crate::worker_env::{CorpusEntry, WorkerEnv};
 pub fn add_return_value_to_dict(dict: &mut GenDict, val: alloy_dyn_abi::DynSolValue) {
     use alloy_dyn_abi::DynSolValue;
 
-    // ALWAYS add the whole value first (preserves structs for reuse)
-    // This enables passing complete structs to other functions
-    dict.add_value(val.clone());
-
-    // ALSO decompose for primitive extraction (enables mixing struct fields)
+    // Decompose first while we still have a borrow, then move val into add_value
     match &val {
         // For tuples/structs, also extract each element individually
         DynSolValue::Tuple(elements) => {
@@ -39,9 +35,10 @@ pub fn add_return_value_to_dict(dict: &mut GenDict, val: alloy_dyn_abi::DynSolVa
                 add_return_value_to_dict(dict, elem.clone());
             }
         }
-        // Primitive types are already added above
         _ => {}
     }
+    // Move val — no clone needed here
+    dict.add_value(val);
 }
 
 /// Extract dictionary values from call traces at ALL depths

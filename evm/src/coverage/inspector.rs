@@ -13,9 +13,7 @@ use revm::{
     Inspector,
 };
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
-use rustc_hash::FxHashMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::cheatcodes::{CheatcodeInspector, CheatcodeState, HEVM_ADDRESS};
 
@@ -133,7 +131,7 @@ pub fn compute_metadata_hash(bytecode: &[u8]) -> B256 {
 /// the same base contract). We store (bytecode_len, codehash) pairs and use bytecode length
 /// as a tiebreaker at runtime.
 pub fn build_codehash_map(contracts: &[crate::foundry::CompiledContract]) -> MetadataToCodehash {
-    let mut map: MetadataToCodehash = HashMap::new();
+    let mut map: MetadataToCodehash = FxHashMap::default();
 
     for contract in contracts {
         // Add deployed (runtime) bytecode
@@ -285,19 +283,19 @@ pub fn resolve_codehash(
 /// Map from metadata hash to list of (bytecode_len, codehash) pairs
 /// Multiple contracts may share the same metadata hash, so we store all of them
 /// and use bytecode length as a tiebreaker at runtime
-pub type MetadataToCodehash = HashMap<B256, Vec<(usize, B256)>>;
+pub type MetadataToCodehash = FxHashMap<B256, Vec<(usize, B256)>>;
 
 /// Inspector for collecting coverage information
 #[derive(Debug, Default, Clone)]
 pub struct CoverageInspector {
     /// Set of executed (address, pc, stack_depth)
-    pub touched: HashSet<(Address, usize, u64)>,
+    pub touched: FxHashSet<(Address, usize, u64)>,
 }
 
 impl CoverageInspector {
     pub fn new() -> Self {
         Self {
-            touched: HashSet::new(),
+            touched: FxHashSet::default(),
         }
     }
 }
@@ -333,7 +331,7 @@ pub struct DeploymentPcCounter {
     /// Metadata hash -> compile-time codehash mapping
     metadata_to_codehash: std::sync::Arc<parking_lot::RwLock<MetadataToCodehash>>,
     /// Cache: bytecode pointer -> codehash (fast lookup within single tx)
-    bytecode_ptr_cache: HashMap<(usize, usize), B256>,
+    bytecode_ptr_cache: FxHashMap<(usize, usize), B256>,
     /// Stack of codehashes for nested CREATE contexts
     /// When CREATE is called, we compute and push the init code's codehash
     /// This ensures we track the correct codehash during constructor execution
@@ -346,7 +344,7 @@ impl DeploymentPcCounter {
             touched: Vec::with_capacity(TOUCHED_INITIAL_CAPACITY),
             call_depth: 0,
             metadata_to_codehash,
-            bytecode_ptr_cache: HashMap::new(),
+            bytecode_ptr_cache: FxHashMap::default(),
             create_codehash_stack: Vec::new(),
         }
     }
@@ -527,11 +525,11 @@ pub struct CombinedInspector {
     /// Cache of metadata_hash -> compile-time codehash
     /// NOTE: We key by metadata_hash (bytecode identity) not address, because for DELEGATECALL
     /// the same address can execute different bytecode (caller vs library)
-    pub codehash_cache: HashMap<B256, B256>,
+    pub codehash_cache: FxHashMap<B256, B256>,
     /// Fast cache: (bytecode_ptr, bytecode_len) -> codehash
     /// This avoids re-computing metadata_hash for the same bytecode in a single tx
     /// The bytecode pointer is stable within a single interpreter execution
-    pub bytecode_ptr_cache: HashMap<(usize, usize), B256>,
+    pub bytecode_ptr_cache: FxHashMap<(usize, usize), B256>,
     /// Map from metadata hash to compile-time codehash (shared, built at startup)
     pub metadata_to_codehash: std::sync::Arc<parking_lot::RwLock<MetadataToCodehash>>,
     /// Cheatcode state
@@ -559,9 +557,9 @@ impl CombinedInspector {
             call_depth: 0, // Start at 0, incremented on first call
             nested_panic_1: false,
             nested_invalid_fe: false,
-            codehash_cache: HashMap::new(),
-            bytecode_ptr_cache: HashMap::new(),
-            metadata_to_codehash: std::sync::Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            codehash_cache: FxHashMap::default(),
+            bytecode_ptr_cache: FxHashMap::default(),
+            metadata_to_codehash: std::sync::Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
             cheatcode: CheatcodeInspector::new(),
             created_addresses: Vec::new(),
             coverage_mode: CoverageMode::Full, // Default to full coverage
@@ -578,8 +576,8 @@ impl CombinedInspector {
             call_depth: 0,
             nested_panic_1: false,
             nested_invalid_fe: false,
-            codehash_cache: HashMap::new(),
-            bytecode_ptr_cache: HashMap::new(),
+            codehash_cache: FxHashMap::default(),
+            bytecode_ptr_cache: FxHashMap::default(),
             metadata_to_codehash,
             cheatcode: CheatcodeInspector::new(),
             created_addresses: Vec::new(),
@@ -1119,7 +1117,7 @@ pub fn coverage_stats(
 ) -> (usize, usize) {
     // Combine both coverage maps
     let mut all_points = 0usize;
-    let mut codehashes = HashSet::new();
+    let mut codehashes = FxHashSet::default();
 
     for (codehash, pcs) in init_coverage.iter().chain(runtime_coverage.iter()) {
         codehashes.insert(*codehash);
@@ -1146,7 +1144,7 @@ pub struct TracingWithCheatcodes {
     pub cheatcode: CheatcodeInspector,
     pub tracing: revm_inspectors::tracing::TracingInspector,
     /// Storage reads captured during execution: (address, slot) -> value
-    pub storage_reads: HashMap<(Address, U256), U256>,
+    pub storage_reads: FxHashMap<(Address, U256), U256>,
     /// Pending SLOAD: slot being loaded (set in step, value captured in step_end)
     pending_sload: Option<(Address, U256)>,
     /// PCs hit during execution: (codehash, pc) for solver closest approach tracking
@@ -1160,7 +1158,7 @@ impl TracingWithCheatcodes {
         Self {
             cheatcode: CheatcodeInspector::new(),
             tracing: revm_inspectors::tracing::TracingInspector::new(config),
-            storage_reads: HashMap::new(),
+            storage_reads: FxHashMap::default(),
             pending_sload: None,
             pcs_hit: Vec::new(),
             current_codehash: None,
@@ -1172,12 +1170,12 @@ impl TracingWithCheatcodes {
     }
 
     /// Get captured storage reads from this transaction
-    pub fn get_storage_reads(&self) -> &HashMap<(Address, U256), U256> {
+    pub fn get_storage_reads(&self) -> &FxHashMap<(Address, U256), U256> {
         &self.storage_reads
     }
 
     /// Take storage reads (consumes the map)
-    pub fn take_storage_reads(&mut self) -> HashMap<(Address, U256), U256> {
+    pub fn take_storage_reads(&mut self) -> FxHashMap<(Address, U256), U256> {
         std::mem::take(&mut self.storage_reads)
     }
 
