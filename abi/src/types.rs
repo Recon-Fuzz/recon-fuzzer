@@ -6,7 +6,8 @@ use alloy_json_abi::{Function, StateMutability};
 use alloy_primitives::{FixedBytes, I256, U256};
 use primitives::{INITIAL_BLOCK_NUMBER, INITIAL_TIMESTAMP};
 use rand::Rng;
-use std::collections::{BTreeSet, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
 
 /// BTreeSet wrapper with a cached Vec for O(1) random access.
 ///
@@ -113,7 +114,7 @@ pub type SolCall = (String, Vec<DynSolValue>);
 
 /// Map from function signatures to sets of concrete calls
 /// Using Vec instead of HashSet since DynSolValue doesn't impl Hash
-pub type SignatureMap = HashMap<alloy_primitives::Address, Vec<SolSignature>>;
+pub type SignatureMap = FxHashMap<alloy_primitives::Address, Vec<SolSignature>>;
 
 /// Configuration for generating random ABI values
 #[derive(Debug, Clone)]
@@ -123,16 +124,16 @@ pub struct GenDict {
 
     /// Constants extracted from source, indexed by type
     /// Using Vec instead of HashSet since DynSolValue doesn't impl Hash
-    pub constants: HashMap<String, Vec<DynSolValue>>,
+    pub constants: FxHashMap<String, Vec<DynSolValue>>,
 
     /// Complete calls seen during fuzzing, for replay
-    pub whole_calls: HashMap<SolSignature, Vec<SolCall>>,
+    pub whole_calls: FxHashMap<SolSignature, Vec<SolCall>>,
 
     /// RNG seed
     pub seed: u64,
 
     /// Return types from functions (for generating matching values)
-    pub return_types: HashMap<String, DynSolType>,
+    pub return_types: FxHashMap<String, DynSolType>,
 
     /// A set of int/uint constants for better performance
     /// Uses CachedSet for O(1) random picks (Echidna uses Set.elemAt for O(log n))
@@ -150,7 +151,7 @@ pub struct GenDict {
     /// When a sequence improves an optimization test, we remember which functions were called.
     /// These functions are given higher weight during transaction generation.
     /// Key: function name, Value: count of times it improved optimization
-    pub optimization_hot_functions: HashMap<String, usize>,
+    pub optimization_hot_functions: FxHashMap<String, usize>,
     
     /// TARGETED ARGUMENT EVOLUTION: Values that were used when optimization improved
     /// These are "hot values" that should be prioritized in argument generation
@@ -167,14 +168,14 @@ impl Default for GenDict {
     fn default() -> Self {
         Self {
             dict_freq: 0.40, // 40% dictionary, 60% synthesis
-            constants: HashMap::new(),
-            whole_calls: HashMap::new(),
+            constants: FxHashMap::default(),
+            whole_calls: FxHashMap::default(),
             seed: 0,
-            return_types: HashMap::new(),
+            return_types: FxHashMap::default(),
             dict_values: CachedSet::new(),
             signed_dict_values: BTreeSet::new(),
             callback_sigs: Vec::new(),
-            optimization_hot_functions: HashMap::new(),
+            optimization_hot_functions: FxHashMap::default(),
             optimization_hot_values: BTreeSet::new(),
             optimization_hot_signed_values: BTreeSet::new(),
         }
