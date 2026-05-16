@@ -8,7 +8,6 @@ use revm::context_interface::result::{ExecutionResult, Output};
 use revm::state::AccountInfo;
 use revm::{Context, Database, DatabaseCommit, InspectEvm, MainBuilder, MainContext};
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
 
 use crate::types::{Tx, TxCall, TxResult};
 

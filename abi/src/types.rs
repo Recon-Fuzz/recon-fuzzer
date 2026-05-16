@@ -106,6 +106,57 @@ impl<'a, T: Ord + Clone> IntoIterator for &'a CachedSet<T> {
     }
 }
 
+/// Discriminant for `GenDict::constants` — avoids String allocation for scalar types.
+///
+/// Common scalars (Uint, Int, Bool, Address, Bytes, String, FixedBytes) use zero-alloc
+/// Copy-like variants. Complex structural types (Array, Tuple, etc.) fall back to a
+/// heap-allocated key only when needed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ValueKind {
+    Uint(usize),
+    Int(usize),
+    Bool,
+    Address,
+    Bytes,
+    StringVal,
+    FixedBytes(usize),
+    Complex(Box<str>),
+}
+
+impl ValueKind {
+    pub fn from_value(val: &DynSolValue) -> Self {
+        match val {
+            DynSolValue::Uint(_, bits) => Self::Uint(*bits),
+            DynSolValue::Int(_, bits) => Self::Int(*bits),
+            DynSolValue::Bool(_) => Self::Bool,
+            DynSolValue::Address(_) => Self::Address,
+            DynSolValue::Bytes(_) => Self::Bytes,
+            DynSolValue::String(_) => Self::StringVal,
+            DynSolValue::FixedBytes(_, n) => Self::FixedBytes(*n),
+            other => Self::Complex(
+                other
+                    .sol_type_name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+                    .into_boxed_str(),
+            ),
+        }
+    }
+
+    pub fn from_type(ty: &DynSolType) -> Self {
+        match ty {
+            DynSolType::Uint(bits) => Self::Uint(*bits),
+            DynSolType::Int(bits) => Self::Int(*bits),
+            DynSolType::Bool => Self::Bool,
+            DynSolType::Address => Self::Address,
+            DynSolType::Bytes => Self::Bytes,
+            DynSolType::String => Self::StringVal,
+            DynSolType::FixedBytes(n) => Self::FixedBytes(*n),
+            other => Self::Complex(other.sol_type_name().to_string().into_boxed_str()),
+        }
+    }
+}
+
 /// A Solidity function signature: (name, parameter types)
 pub type SolSignature = (String, Vec<String>);
 
@@ -124,7 +175,7 @@ pub struct GenDict {
 
     /// Constants extracted from source, indexed by type
     /// Using Vec instead of HashSet since DynSolValue doesn't impl Hash
-    pub constants: FxHashMap<String, Vec<DynSolValue>>,
+    pub constants: FxHashMap<ValueKind, Vec<DynSolValue>>,
 
     /// Complete calls seen during fuzzing, for replay
     pub whole_calls: FxHashMap<SolSignature, Vec<SolCall>>,
@@ -348,13 +399,17 @@ impl GenDict {
                 return;
             }
         }
-        let variants = Self::make_num_values(n);
-        for val in variants {
-            self.signed_dict_values.insert(val);
-            // Also add to unsigned if positive
-            if val >= I256::ZERO {
-                if let Ok(unsigned) = val.try_into() {
-                    self.dict_values.insert(unsigned);
+        // Inline make_num_values to avoid Vec<I256> allocation on the hot path
+        let neg_n = n.saturating_neg();
+        for &range_n in &[n, neg_n] {
+            for offset in -3i128..=3 {
+                if let Ok(val) = I256::try_from(range_n.saturating_add(offset)) {
+                    self.signed_dict_values.insert(val);
+                    if val >= I256::ZERO {
+                        if let Ok(unsigned) = val.try_into() {
+                            self.dict_values.insert(unsigned);
+                        }
+                    }
                 }
             }
         }
@@ -362,12 +417,9 @@ impl GenDict {
 
     /// Add constants to the dictionary
     /// Updates both constants map, dict_values set, and signed_dict_values
-    /// Also generates ±N and ±N±3 variants for numeric constants 
+    /// Also generates ±N and ±N±3 variants for numeric constants
     pub fn add_constants(&mut self, values: impl IntoIterator<Item = DynSolValue>) {
         for val in values {
-            // CRITICAL: Must match format used in get_from_dict
-            let type_name = val.sol_type_name().map(|s| s.to_string()).unwrap_or_default();
-
             // Also add to dict_values if it's a numeric type
             // AND generate signed variants with make_num_values
             match &val {
@@ -396,7 +448,11 @@ impl GenDict {
                 _ => {}
             }
 
-            self.constants.entry(type_name).or_default().push(val);
+            let kind = ValueKind::from_value(&val);
+            let vec = self.constants.entry(kind).or_default();
+            if vec.len() < 200 {
+                vec.push(val);
+            }
         }
     }
 
