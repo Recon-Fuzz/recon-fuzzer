@@ -2,6 +2,8 @@
 //!
 //! Implements dictionary-based and synthesized value generation
 
+use std::sync::OnceLock;
+
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address, FixedBytes, I256, U256};
 use rand::prelude::*;
@@ -14,11 +16,13 @@ pub const COMMON_TYPE_SIZES: &[usize] = &[
     176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
 
-/// Pre-generated dummy addresses for fuzzing
-pub fn pregen_addresses() -> Vec<Address> {
-    (1u64..=3)
-        .map(|i| Address::from_word(U256::from(i * 0xffffffff).into()))
-        .collect()
+static PREGEN_ADDRESSES: OnceLock<[Address; 3]> = OnceLock::new();
+
+/// Pre-generated dummy addresses for fuzzing — allocated once, reused every call
+pub fn pregen_addresses() -> &'static [Address] {
+    PREGEN_ADDRESSES.get_or_init(|| {
+        [1u64, 2, 3].map(|i| Address::from_word(U256::from(i * 0xffffffff).into()))
+    })
 }
 
 /// Generate a random unsigned integer with echidna's distribution:
