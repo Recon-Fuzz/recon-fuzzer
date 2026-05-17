@@ -367,15 +367,6 @@ pub fn gen_abi_call_m<R: Rng>(
     name: &str,
     param_types: &[DynSolType],
 ) -> (String, Vec<DynSolValue>) {
-    // Build signature for lookup (must match add_call signature format)
-    let sig = (
-        name.to_string(),
-        param_types
-            .iter()
-            .map(|t| t.sol_type_name().to_string())
-            .collect::<Vec<String>>(),
-    );
-
     // Step 1: Generate fresh arguments FIRST (args <- mapM genAbiValueM)
     // This MUST happen before wholeCalls decision to match RNG consumption order
     let fresh_args: Vec<DynSolValue> = param_types
@@ -387,12 +378,17 @@ pub fn gen_abi_call_m<R: Rng>(
     let use_dict: f32 = rng.gen();
     let should_use_whole_calls = use_dict < dict.dict_freq;
 
-    // Step 3: Optionally lookup whole_calls (maybeValM)
+    // Step 3: Optionally lookup whole_calls (maybeValM) — build sig only when needed
     let sol_call = if should_use_whole_calls {
-        // Try to get a complete call from dictionary
+        let sig = (
+            name.to_string(),
+            param_types
+                .iter()
+                .map(|t| t.sol_type_name().to_string())
+                .collect::<Vec<String>>(),
+        );
         if let Some(calls) = dict.whole_calls.get(&sig) {
             if !calls.is_empty() {
-                // Pick a random successful call from dictionary
                 let idx = rng.gen_range(0..calls.len());
                 Some(calls[idx].clone())
             } else {
