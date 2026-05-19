@@ -131,8 +131,8 @@ impl Env {
             contracts,
             main_contract: None,
             test_refs: Vec::new(),
-            coverage_ref_init: Arc::new(RwLock::new(HashMap::new())),
-            coverage_ref_runtime: Arc::new(RwLock::new(HashMap::new())),
+            coverage_ref_init: Arc::new(RwLock::new(Default::default())),
+            coverage_ref_runtime: Arc::new(RwLock::new(Default::default())),
             corpus_ref: Arc::new(RwLock::new(Vec::new())), // Vec<(priority, txs)>
             corpus_seen: Arc::new(RwLock::new(std::collections::HashSet::new())),
             codehash_map: Arc::new(RwLock::new(codehash_map)),

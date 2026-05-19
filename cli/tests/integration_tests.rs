@@ -269,7 +269,7 @@ mod mutation_tests {
         let mut rng = StdRng::seed_from_u64(12345);
         let value = DynSolValue::Uint(U256::from(100), 256);
 
-        let mutated = mutate::mutate_abi_value(&mut rng, &value);
+        let mutated = mutate::mutate_abi_value(&mut rng, value);
 
         // Should still be a Uint256
         assert!(matches!(mutated, DynSolValue::Uint(_, 256)));
@@ -281,12 +281,12 @@ mod mutation_tests {
 
         // Test various types
         let bool_val = DynSolValue::Bool(true);
-        let mutated_bool = mutate::mutate_abi_value(&mut rng, &bool_val);
+        let mutated_bool = mutate::mutate_abi_value(&mut rng, bool_val);
         assert!(matches!(mutated_bool, DynSolValue::Bool(_)));
 
         let addr = alloy_primitives::Address::repeat_byte(0x42);
         let addr_val = DynSolValue::Address(addr);
-        let mutated_addr = mutate::mutate_abi_value(&mut rng, &addr_val);
+        let mutated_addr = mutate::mutate_abi_value(&mut rng, addr_val);
         assert!(matches!(mutated_addr, DynSolValue::Address(_)));
     }
 }

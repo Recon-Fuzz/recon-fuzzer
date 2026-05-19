@@ -11,31 +11,31 @@ use crate::mutable::Mutable;
 
 /// Mutate an ABI value to a "similar" value
 /// 10% chance of actual mutation
-pub fn mutate_abi_value<R: Rng>(rng: &mut R, value: &DynSolValue) -> DynSolValue {
+pub fn mutate_abi_value<R: Rng>(rng: &mut R, value: DynSolValue) -> DynSolValue {
     match value {
         DynSolValue::Uint(n, bits) => {
             // 10% chance
             if rng.gen_range(0..10) == 0 {
-                let mutated = mutate_num_u256(rng, *n);
-                if *bits >= 256 {
-                    DynSolValue::Uint(mutated, *bits)
+                let mutated = mutate_num_u256(rng, n);
+                if bits >= 256 {
+                    DynSolValue::Uint(mutated, bits)
                 } else {
                     let max_val = (U256::from(1) << bits) - U256::from(1);
-                    DynSolValue::Uint(mutated % (max_val + U256::from(1)), *bits)
+                    DynSolValue::Uint(mutated % (max_val + U256::from(1)), bits)
                 }
             } else {
-                value.clone()
+                DynSolValue::Uint(n, bits)
             }
         }
 
         DynSolValue::Int(n, bits) => {
             // 10% chance
             if rng.gen_range(0..10) == 0 {
-                let mutated = mutate_num_i256(rng, *n);
-                if *bits >= 256 {
-                    DynSolValue::Int(mutated, *bits)
+                let mutated = mutate_num_i256(rng, n);
+                if bits >= 256 {
+                    DynSolValue::Int(mutated, bits)
                 } else {
-                    let max = (I256::ONE << (*bits - 1)) - I256::ONE;
+                    let max = (I256::ONE << (bits - 1)) - I256::ONE;
                     let min = -max - I256::ONE;
                     let clamped = if mutated > max {
                         max
@@ -44,19 +44,17 @@ pub fn mutate_abi_value<R: Rng>(rng: &mut R, value: &DynSolValue) -> DynSolValue
                     } else {
                         mutated
                     };
-                    DynSolValue::Int(clamped, *bits)
+                    DynSolValue::Int(clamped, bits)
                 }
             } else {
-                value.clone()
+                DynSolValue::Int(n, bits)
             }
         }
-
-        DynSolValue::Address(_) => value.clone(),
 
         DynSolValue::Bool(_) => DynSolValue::Bool(rng.gen()),
 
         DynSolValue::Bytes(b) => {
-            DynSolValue::Bytes(crate::mutator_array::mutate_ll(rng, None, vec![], b))
+            DynSolValue::Bytes(crate::mutator_array::mutate_ll(rng, None, vec![], &b))
         }
 
         DynSolValue::String(s) => {
@@ -67,42 +65,42 @@ pub fn mutate_abi_value<R: Rng>(rng: &mut R, value: &DynSolValue) -> DynSolValue
 
         DynSolValue::FixedBytes(b, size) => {
             let bytes = b.to_vec();
-            let random_bytes: Vec<u8> = (0..*size).map(|_| rng.gen()).collect();
-            let mutated = crate::mutator_array::mutate_ll(rng, Some(*size), random_bytes, &bytes);
+            let random_bytes: Vec<u8> = (0..size).map(|_| rng.gen()).collect();
+            let mutated = crate::mutator_array::mutate_ll(rng, Some(size), random_bytes, &bytes);
             // DynSolValue::FixedBytes stores (FixedBytes<32>, actual_size)
             // We must create a 32-byte buffer with mutated data in the first `size` bytes
             let mut padded = [0u8; 32];
             let copy_len = mutated.len().min(32);
             padded[..copy_len].copy_from_slice(&mutated[..copy_len]);
-            DynSolValue::FixedBytes(alloy_primitives::FixedBytes::from_slice(&padded), *size)
+            DynSolValue::FixedBytes(alloy_primitives::FixedBytes::from_slice(&padded), size)
         }
 
         DynSolValue::Array(elements) => {
-            DynSolValue::Array(crate::mutator_array::mutate_ll(rng, None, vec![], elements))
+            DynSolValue::Array(crate::mutator_array::mutate_ll(rng, None, vec![], &elements))
         }
 
         DynSolValue::FixedArray(elements) => {
             if elements.is_empty() {
-                value.clone()
+                DynSolValue::FixedArray(elements)
             } else {
                 let len = elements.len();
-                let element_type = infer_element_type(elements);
+                let element_type = infer_element_type(&elements);
                 let complement: Vec<DynSolValue> = (0..len)
                     .map(|_| generate_fresh_value(rng, &element_type))
                     .collect();
 
-                let mutated = crate::mutator_array::mutate_ll(rng, Some(len), complement, elements);
+                let mutated = crate::mutator_array::mutate_ll(rng, Some(len), complement, &elements);
                 DynSolValue::FixedArray(mutated)
             }
         }
 
         DynSolValue::Tuple(elements) => {
             let new_elements: Vec<DynSolValue> =
-                elements.iter().map(|e| mutate_abi_value(rng, e)).collect();
+                elements.into_iter().map(|e| mutate_abi_value(rng, e)).collect();
             DynSolValue::Tuple(new_elements)
         }
 
-        _ => value.clone(),
+        other => other,
     }
 }
 
@@ -263,7 +261,8 @@ pub fn mutate_call<R: Rng>(
 
     // Mutate a single random argument (matches Echidna exactly)
     let idx = rng.gen_range(0..args.len());
-    new_args[idx] = mutate_abi_value(rng, &args[idx]);
+    let val = std::mem::replace(&mut new_args[idx], DynSolValue::Bool(false));
+    new_args[idx] = mutate_abi_value(rng, val);
 
     (name.to_string(), new_args)
 }
@@ -277,10 +276,9 @@ pub fn mutate_call<R: Rng>(
 ///
 /// This is the recommended mutation function for new code.
 /// providing richer mutation strategies.
-pub fn mutate_abi_value_enhanced<R: Rng>(rng: &mut R, value: &DynSolValue) -> DynSolValue {
-    let mut result = value.clone();
-    result.mutate(rng);
-    result
+pub fn mutate_abi_value_enhanced<R: Rng>(rng: &mut R, mut value: DynSolValue) -> DynSolValue {
+    value.mutate(rng);
+    value
 }
 
 /// Enhanced call mutation using the Mutable trait

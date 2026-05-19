@@ -6,7 +6,8 @@ use alloy_json_abi::{Function, StateMutability};
 use alloy_primitives::{FixedBytes, I256, U256};
 use primitives::{INITIAL_BLOCK_NUMBER, INITIAL_TIMESTAMP};
 use rand::Rng;
-use std::collections::{BTreeSet, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
 
 /// BTreeSet wrapper with a cached Vec for O(1) random access.
 ///
@@ -105,6 +106,57 @@ impl<'a, T: Ord + Clone> IntoIterator for &'a CachedSet<T> {
     }
 }
 
+/// Discriminant for `GenDict::constants` — avoids String allocation for scalar types.
+///
+/// Common scalars (Uint, Int, Bool, Address, Bytes, String, FixedBytes) use zero-alloc
+/// Copy-like variants. Complex structural types (Array, Tuple, etc.) fall back to a
+/// heap-allocated key only when needed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ValueKind {
+    Uint(usize),
+    Int(usize),
+    Bool,
+    Address,
+    Bytes,
+    StringVal,
+    FixedBytes(usize),
+    Complex(Box<str>),
+}
+
+impl ValueKind {
+    pub fn from_value(val: &DynSolValue) -> Self {
+        match val {
+            DynSolValue::Uint(_, bits) => Self::Uint(*bits),
+            DynSolValue::Int(_, bits) => Self::Int(*bits),
+            DynSolValue::Bool(_) => Self::Bool,
+            DynSolValue::Address(_) => Self::Address,
+            DynSolValue::Bytes(_) => Self::Bytes,
+            DynSolValue::String(_) => Self::StringVal,
+            DynSolValue::FixedBytes(_, n) => Self::FixedBytes(*n),
+            other => Self::Complex(
+                other
+                    .sol_type_name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+                    .into_boxed_str(),
+            ),
+        }
+    }
+
+    pub fn from_type(ty: &DynSolType) -> Self {
+        match ty {
+            DynSolType::Uint(bits) => Self::Uint(*bits),
+            DynSolType::Int(bits) => Self::Int(*bits),
+            DynSolType::Bool => Self::Bool,
+            DynSolType::Address => Self::Address,
+            DynSolType::Bytes => Self::Bytes,
+            DynSolType::String => Self::StringVal,
+            DynSolType::FixedBytes(n) => Self::FixedBytes(*n),
+            other => Self::Complex(other.sol_type_name().to_string().into_boxed_str()),
+        }
+    }
+}
+
 /// A Solidity function signature: (name, parameter types)
 pub type SolSignature = (String, Vec<String>);
 
@@ -113,7 +165,7 @@ pub type SolCall = (String, Vec<DynSolValue>);
 
 /// Map from function signatures to sets of concrete calls
 /// Using Vec instead of HashSet since DynSolValue doesn't impl Hash
-pub type SignatureMap = HashMap<alloy_primitives::Address, Vec<SolSignature>>;
+pub type SignatureMap = FxHashMap<alloy_primitives::Address, Vec<SolSignature>>;
 
 /// Configuration for generating random ABI values
 #[derive(Debug, Clone)]
@@ -123,16 +175,16 @@ pub struct GenDict {
 
     /// Constants extracted from source, indexed by type
     /// Using Vec instead of HashSet since DynSolValue doesn't impl Hash
-    pub constants: HashMap<String, Vec<DynSolValue>>,
+    pub constants: FxHashMap<ValueKind, Vec<DynSolValue>>,
 
     /// Complete calls seen during fuzzing, for replay
-    pub whole_calls: HashMap<SolSignature, Vec<SolCall>>,
+    pub whole_calls: FxHashMap<SolSignature, Vec<SolCall>>,
 
     /// RNG seed
     pub seed: u64,
 
     /// Return types from functions (for generating matching values)
-    pub return_types: HashMap<String, DynSolType>,
+    pub return_types: FxHashMap<String, DynSolType>,
 
     /// A set of int/uint constants for better performance
     /// Uses CachedSet for O(1) random picks (Echidna uses Set.elemAt for O(log n))
@@ -150,7 +202,7 @@ pub struct GenDict {
     /// When a sequence improves an optimization test, we remember which functions were called.
     /// These functions are given higher weight during transaction generation.
     /// Key: function name, Value: count of times it improved optimization
-    pub optimization_hot_functions: HashMap<String, usize>,
+    pub optimization_hot_functions: FxHashMap<String, usize>,
     
     /// TARGETED ARGUMENT EVOLUTION: Values that were used when optimization improved
     /// These are "hot values" that should be prioritized in argument generation
@@ -167,14 +219,14 @@ impl Default for GenDict {
     fn default() -> Self {
         Self {
             dict_freq: 0.40, // 40% dictionary, 60% synthesis
-            constants: HashMap::new(),
-            whole_calls: HashMap::new(),
+            constants: FxHashMap::default(),
+            whole_calls: FxHashMap::default(),
             seed: 0,
-            return_types: HashMap::new(),
+            return_types: FxHashMap::default(),
             dict_values: CachedSet::new(),
             signed_dict_values: BTreeSet::new(),
             callback_sigs: Vec::new(),
-            optimization_hot_functions: HashMap::new(),
+            optimization_hot_functions: FxHashMap::default(),
             optimization_hot_values: BTreeSet::new(),
             optimization_hot_signed_values: BTreeSet::new(),
         }
@@ -341,13 +393,23 @@ impl GenDict {
     
     /// Add a numeric constant and its variants to the dictionary
     pub fn add_numeric_constant(&mut self, n: i128) {
-        let variants = Self::make_num_values(n);
-        for val in variants {
-            self.signed_dict_values.insert(val);
-            // Also add to unsigned if positive
-            if val >= I256::ZERO {
-                if let Ok(unsigned) = val.try_into() {
-                    self.dict_values.insert(unsigned);
+        // Skip if base value already known — variants were generated on first insertion
+        if let Ok(base) = I256::try_from(n) {
+            if self.signed_dict_values.contains(&base) {
+                return;
+            }
+        }
+        // Inline make_num_values to avoid Vec<I256> allocation on the hot path
+        let neg_n = n.saturating_neg();
+        for &range_n in &[n, neg_n] {
+            for offset in -3i128..=3 {
+                if let Ok(val) = I256::try_from(range_n.saturating_add(offset)) {
+                    self.signed_dict_values.insert(val);
+                    if val >= I256::ZERO {
+                        if let Ok(unsigned) = val.try_into() {
+                            self.dict_values.insert(unsigned);
+                        }
+                    }
                 }
             }
         }
@@ -355,12 +417,9 @@ impl GenDict {
 
     /// Add constants to the dictionary
     /// Updates both constants map, dict_values set, and signed_dict_values
-    /// Also generates ±N and ±N±3 variants for numeric constants 
+    /// Also generates ±N and ±N±3 variants for numeric constants
     pub fn add_constants(&mut self, values: impl IntoIterator<Item = DynSolValue>) {
         for val in values {
-            // CRITICAL: Must match format used in get_from_dict
-            let type_name = val.sol_type_name().map(|s| s.to_string()).unwrap_or_default();
-
             // Also add to dict_values if it's a numeric type
             // AND generate signed variants with make_num_values
             match &val {
@@ -389,7 +448,11 @@ impl GenDict {
                 _ => {}
             }
 
-            self.constants.entry(type_name).or_default().push(val);
+            let kind = ValueKind::from_value(&val);
+            let vec = self.constants.entry(kind).or_default();
+            if vec.len() < 200 {
+                vec.push(val);
+            }
         }
     }
 
