@@ -33,3 +33,14 @@ chrono = "0.4"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 askama.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "shrink_contention"
+harness = false
+
+[[bench]]
+name = "fuzz_hotpath"
+harness = false

@@ -440,13 +440,16 @@ fn shrink_seq<R: Rng>(
         .map(|c| remove_useless_no_calls(absorb_no_calls(cat_no_calls(c))))
         .collect();
 
-    // Validate candidates in parallel and collect valid ones
+    // Validate candidates in parallel and collect valid ones.
+    // Pre-encode SolCall→SolCalldata once per candidate to avoid
+    // re-computing keccak256 selectors + ABI encoding on every replay.
     let test_value = &test.value;
     let valid_results: Vec<(Vec<Tx>, TestValue)> = candidates
         .into_par_iter()
         .filter_map(|candidate| {
+            let encoded = pre_encode_sequence(&candidate);
             let mut vm = initial_vm.clone();
-            let val = execute_and_check(&mut vm, &candidate, test, gen_calls_setup.as_ref())
+            let val = execute_and_check(&mut vm, &encoded, test, gen_calls_setup.as_ref())
                 .ok()?;
 
             match (&val, test_value) {
@@ -459,10 +462,6 @@ fn shrink_seq<R: Rng>(
         })
         .collect();
 
-    // Return the best valid candidate using lexicographic ordering:
-    // 1. Prefer shorter sequences (fewer transactions)
-    // 2. When lengths are equal, prefer smaller value complexity (args + delays combined)
-    // 3. Break ties by delay complexity specifically (prefer smaller total delays)
     Ok(valid_results.into_iter().min_by(|(txs_a, _), (txs_b, _)| {
         let len_cmp = txs_a.len().cmp(&txs_b.len());
         if len_cmp != std::cmp::Ordering::Equal {
@@ -488,6 +487,25 @@ fn shrink_seq<R: Rng>(
 /// when restoring `vm.generateCalls()` determinism per tx. Pass `None` if
 /// the test's reproducer never invoked the cheatcode (cheap check on the
 /// caller's side avoids unnecessary work).
+/// Pre-encode SolCall txs to SolCalldata to avoid re-computing keccak256
+/// selectors and ABI encoding on every replay.
+fn pre_encode_sequence(txs: &[Tx]) -> Vec<Tx> {
+    txs.iter()
+        .map(|tx| match &tx.call {
+            TxCall::SolCall { name, args } => {
+                match evm::exec::encode_call(name, args) {
+                    Ok(calldata) => Tx {
+                        call: TxCall::SolCalldata(calldata),
+                        ..tx.clone()
+                    },
+                    Err(_) => tx.clone(),
+                }
+            }
+            _ => tx.clone(),
+        })
+        .collect()
+}
+
 fn execute_and_check(
     vm: &mut EvmState,
     txs: &[Tx],
@@ -503,13 +521,6 @@ fn execute_and_check(
 ) -> anyhow::Result<TestValue> {
     use crate::testing::check_etest;
 
-    // Execute all transactions in order. The nested-panic flags
-    // (`vm.last_nested_panic_1` / `vm.last_nested_invalid_fe`) are written by
-    // every tx, so without accumulation an earlier tx that *did* trigger the
-    // bug gets its flag clobbered by a later non-bug tx, and `check_etest`
-    // below sees a stale `false`. Mirror the fuzz-time semantics (test is
-    // checked right after each tx) by OR-ing the flags across the whole
-    // replay before checking.
     let mut acc_nested_panic_1 = false;
     let mut acc_nested_invalid_fe = false;
     for tx in txs {
@@ -520,12 +531,9 @@ fn execute_and_check(
         acc_nested_panic_1 |= vm.last_nested_panic_1;
         acc_nested_invalid_fe |= vm.last_nested_invalid_fe;
     }
-    // Reinstall the accumulated flags so check_assertion / check_call_test
-    // see the same view of the sequence the fuzz path saw at failure time.
     vm.last_nested_panic_1 = acc_nested_panic_1;
     vm.last_nested_invalid_fe = acc_nested_invalid_fe;
 
-    // Check using check_etest (f vm' where f = checkETest test)
     let sender = txs.last().map(|t| t.src).unwrap_or(Address::ZERO);
     let (val, _res) = check_etest(vm, test, sender)?;
 
@@ -923,12 +931,11 @@ fn shrink_seq_worker<R: Rng>(
     let valid_results: Vec<(Vec<Tx>, TestValue)> = candidates
         .into_par_iter()
         .filter_map(|candidate| {
-            // Each parallel task gets its own VM clone
+            let encoded = pre_encode_sequence(&candidate);
             let mut vm = initial_vm.clone();
-            let val = execute_and_check(&mut vm, &candidate, test, gen_calls_setup.as_ref())
+            let val = execute_and_check(&mut vm, &encoded, test, gen_calls_setup.as_ref())
                 .ok()?;
 
-            // Check if this candidate is valid (test still fails)
             match (&val, test_value) {
                 (TestValue::BoolValue(false), _) => Some((candidate, val)),
                 (TestValue::IntValue(new), TestValue::IntValue(old)) if new >= old => {

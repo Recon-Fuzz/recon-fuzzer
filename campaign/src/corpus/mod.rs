@@ -11,6 +11,7 @@ pub use loader::{add_to_corpus_worker, load_corpus, load_reproducers_for_shrinki
 
 // Re-export all public items from mutator
 pub use mutator::{
-    apply_corpus_mutation, mutator, select_and_mutate, select_from_corpus, seq_mutators_stateful,
-    seq_mutators_stateless, CorpusMutation, MutationConsts, TxsMutation, DEFAULT_MUTATION_CONSTS,
+    apply_corpus_mutation, apply_corpus_mutation_direct, mutator, select_and_mutate,
+    select_from_corpus, seq_mutators_stateful, seq_mutators_stateless, CorpusMutation,
+    MutationConsts, TxsMutation, DEFAULT_MUTATION_CONSTS,
 };

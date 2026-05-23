@@ -76,49 +76,53 @@ pub fn shrink_pending_tests_worker(
             return Ok(());
         }
 
-        let mut test = test_ref.write();
+        // Snapshot the test under a short-lived read lock to decide whether
+        // this worker should shrink it. The heavy shrinking work runs with
+        // NO lock held so other workers' fuzzing loops aren't blocked.
+        let test_snapshot = {
+            let test = test_ref.read();
+            if test.worker_id != Some(worker.worker_id) {
+                continue;
+            }
+            match test.state {
+                TestState::Large(_) => test.clone(),
+                _ => continue,
+            }
+        };
 
-        if test.worker_id != Some(worker.worker_id) {
-            continue;
-        }
-
-        if let TestState::Large(n) = test.state {
+        if let TestState::Large(n) = test_snapshot.state {
             if n >= shrink_limit as i32 {
-                test.shrink_complete();
+                let mut finished = test_snapshot.clone();
+                finished.shrink_complete();
 
-                // Inner-batch ddmin: prune `vm.generateCalls()` results
-                // to the minimal subset that still triggers the bug.
                 let mut vm_for_inner = initial_vm.clone();
                 if let Err(e) = super::shrink_inner_batches_worker(
                     env,
                     &mut vm_for_inner,
-                    &mut test,
+                    &mut finished,
                 ) {
                     tracing::warn!(
                         "Inner-batch shrink failed for {}: {}",
-                        test.test_type.name(),
+                        finished.test_type.name(),
                         e
                     );
                 }
 
                 output::print_worker_msg(
                     worker.worker_id,
-                    &format!("Shrinking {} complete.", test.test_type.name()),
+                    &format!("Shrinking {} complete.", finished.test_type.name()),
                 );
-                // Pretty-print the shrunk sequence with per-tx
-                // generateCalls annotations (decoded when we have the
-                // dict snapshot + main contract).
                 let cname = env
                     .main_contract
                     .as_ref()
                     .map(|c| c.name.as_str())
                     .unwrap_or("Contract");
-                let decode_args = build_decode_args(env, &test);
+                let decode_args = build_decode_args(env, &finished);
                 let dw = decode_args
                     .as_ref()
                     .map(|(d, f, n)| (d, f.as_slice(), n.as_str()));
                 println!("  Shrunk call sequence:");
-                for tx in &test.reproducer {
+                for tx in &finished.reproducer {
                     println!("    {}", output::format_tx(tx, cname));
                     for line in output::format_generate_calls(tx, dw) {
                         println!("    {}", line);
@@ -126,30 +130,28 @@ pub fn shrink_pending_tests_worker(
                 }
                 println!();
 
-                if let Err(e) = output::save_shrunk_reproducer_worker(env, &test.reproducer) {
+                if let Err(e) = output::save_shrunk_reproducer_worker(env, &finished.reproducer) {
                     tracing::error!("Failed to save shrunk reproducer: {}", e);
                 }
-                try_write_repro(env, &test);
-                // Broadcast shrink completion to web UI
+                try_write_repro(env, &finished);
                 if let Some(ref web_state) = env.web_state {
                     web_state.broadcast_test_state_change(
-                        test.test_type.name(),
-                        &test.state,
-                        Some(&test.reproducer),
+                        finished.test_type.name(),
+                        &finished.state,
+                        Some(&finished.reproducer),
                     );
                 }
+
+                // Brief write lock to commit the result
+                *test_ref.write() = finished;
             } else {
+                // Heavy work: shrink_test_worker runs with NO lock held
                 let mut vm_for_shrink = initial_vm.clone();
 
                 if let Some(mut shrunk_test) =
-                    super::shrink_test_worker(env, &mut vm_for_shrink, &test, rng)?
+                    super::shrink_test_worker(env, &mut vm_for_shrink, &test_snapshot, rng)?
                 {
                     if matches!(shrunk_test.state, TestState::Solved) {
-                        // Inner-batch ddmin: prune `vm.generateCalls()` results
-                        // down to the minimal subset that still triggers the
-                        // bug. Only does work when the test invoked the
-                        // cheatcode and we have a frozen dict snapshot;
-                        // otherwise no-op.
                         let mut vm_for_inner = initial_vm.clone();
                         if let Err(e) = super::shrink_inner_batches_worker(
                             env,
@@ -171,8 +173,6 @@ pub fn shrink_pending_tests_worker(
                                 shrunk_test.reproducer.len()
                             ),
                         );
-                        // Pretty-print the shrunk sequence with per-tx
-                        // generateCalls annotations (seeds + kept indices).
                         let cname = env
                             .main_contract
                             .as_ref()
@@ -198,7 +198,6 @@ pub fn shrink_pending_tests_worker(
                         }
                         try_write_repro(env, &shrunk_test);
                     }
-                    // Broadcast shrink progress to web UI (every attempt, not just completion)
                     if let Some(ref web_state) = env.web_state {
                         web_state.broadcast_test_state_change(
                             shrunk_test.test_type.name(),
@@ -206,10 +205,12 @@ pub fn shrink_pending_tests_worker(
                             Some(&shrunk_test.reproducer),
                         );
                     }
-                    *test = shrunk_test;
+                    // Brief write lock to commit the result
+                    *test_ref.write() = shrunk_test;
                 } else {
+                    // Brief write lock to bump the attempt counter
+                    let mut test = test_ref.write();
                     test.shrink_attempt();
-                    // Broadcast even failed shrink attempts to update progress counter
                     if let Some(ref web_state) = env.web_state {
                         web_state.broadcast_test_state_change(
                             test.test_type.name(),
