@@ -13,14 +13,14 @@ fn test_mutate_uint256_bounds() {
     // Test mutation of zero
     let zero = DynSolValue::Uint(U256::ZERO, 256);
     for _ in 0..10 {
-        let mutated = mutate_abi_value(&mut rng, &zero);
+        let mutated = mutate_abi_value(&mut rng, zero.clone());
         assert!(matches!(mutated, DynSolValue::Uint(_, 256)));
     }
 
     // Test mutation of MAX
     let max = DynSolValue::Uint(U256::MAX, 256);
     for _ in 0..10 {
-        let mutated = mutate_abi_value(&mut rng, &max);
+        let mutated = mutate_abi_value(&mut rng, max.clone());
         assert!(matches!(mutated, DynSolValue::Uint(_, 256)));
     }
 }
@@ -32,7 +32,7 @@ fn test_mutate_uint_respects_bit_width() {
     // uint8 should stay within 0-255
     let uint8_val = DynSolValue::Uint(U256::from(100), 8);
     for _ in 0..20 {
-        let mutated = mutate_abi_value(&mut rng, &uint8_val);
+        let mutated = mutate_abi_value(&mut rng, uint8_val.clone());
         if let DynSolValue::Uint(v, 8) = mutated {
             assert!(v <= U256::from(255), "uint8 exceeded max: {}", v);
         } else {
@@ -48,14 +48,14 @@ fn test_mutate_int256_bounds() {
     // Test mutation of I256::MIN
     let min = DynSolValue::Int(I256::MIN, 256);
     for _ in 0..10 {
-        let mutated = mutate_abi_value(&mut rng, &min);
+        let mutated = mutate_abi_value(&mut rng, min.clone());
         assert!(matches!(mutated, DynSolValue::Int(_, 256)));
     }
 
     // Test mutation of I256::MAX
     let max = DynSolValue::Int(I256::MAX, 256);
     for _ in 0..10 {
-        let mutated = mutate_abi_value(&mut rng, &max);
+        let mutated = mutate_abi_value(&mut rng, max.clone());
         assert!(matches!(mutated, DynSolValue::Int(_, 256)));
     }
 }

@@ -13,6 +13,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use revm::bytecode::Bytecode;
 use revm::context_interface::result::ExecutionResult;
 use revm::state::AccountInfo;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -79,7 +80,7 @@ pub struct EvmState {
 
     /// Storage changes from the last transaction: (address, slot) -> (old_value, new_value)
     /// Only populated for non-reverted transactions
-    pub last_state_diff: HashMap<(Address, U256), (U256, U256)>,
+    pub last_state_diff: FxHashMap<(Address, U256), (U256, U256)>,
 
     /// Address labels set via vm.label() cheatcode
     /// These persist across transactions for trace decoding
@@ -87,7 +88,7 @@ pub struct EvmState {
 
     /// PCs touched during the last transaction: (codehash, pc)
     /// Used by corpus analysis to check if target branches were reached
-    pub last_touched_pcs: std::collections::HashSet<(B256, usize)>,
+    pub last_touched_pcs: FxHashSet<(B256, usize)>,
 
     /// Coverage tracking mode (Full or Branch)
     /// Branch mode only tracks JUMPI/JUMPDEST for faster execution
@@ -156,9 +157,9 @@ impl EvmState {
             last_calldata: Bytes::new(),
             last_call_target: None,
             last_created_addresses: Vec::new(),
-            last_state_diff: HashMap::new(),
+            last_state_diff: FxHashMap::default(),
             labels: HashMap::new(),
-            last_touched_pcs: std::collections::HashSet::new(),
+            last_touched_pcs: FxHashSet::default(),
             coverage_mode: crate::coverage::CoverageMode::Full,
             last_nested_panic_1: false,
             last_nested_invalid_fe: false,
@@ -220,9 +221,9 @@ impl EvmState {
             last_calldata: Bytes::new(),
             last_call_target: None,
             last_created_addresses: Vec::new(),
-            last_state_diff: HashMap::new(),
+            last_state_diff: FxHashMap::default(),
             labels: HashMap::new(),
-            last_touched_pcs: std::collections::HashSet::new(),
+            last_touched_pcs: FxHashSet::default(),
             coverage_mode: crate::coverage::CoverageMode::Full,
             last_nested_panic_1: false,
             last_nested_invalid_fe: false,

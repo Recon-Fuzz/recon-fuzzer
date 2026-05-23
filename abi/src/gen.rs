@@ -2,6 +2,8 @@
 //!
 //! Implements dictionary-based and synthesized value generation
 
+use std::sync::OnceLock;
+
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{Address, FixedBytes, I256, U256};
 use rand::prelude::*;
@@ -14,11 +16,13 @@ pub const COMMON_TYPE_SIZES: &[usize] = &[
     176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256,
 ];
 
-/// Pre-generated dummy addresses for fuzzing
-pub fn pregen_addresses() -> Vec<Address> {
-    (1u64..=3)
-        .map(|i| Address::from_word(U256::from(i * 0xffffffff).into()))
-        .collect()
+static PREGEN_ADDRESSES: OnceLock<[Address; 3]> = OnceLock::new();
+
+/// Pre-generated dummy addresses for fuzzing — allocated once, reused every call
+pub fn pregen_addresses() -> &'static [Address] {
+    PREGEN_ADDRESSES.get_or_init(|| {
+        [1u64, 2, 3].map(|i| Address::from_word(U256::from(i * 0xffffffff).into()))
+    })
 }
 
 /// Generate a random unsigned integer with echidna's distribution:
@@ -202,8 +206,8 @@ fn get_from_dict<R: Rng>(
 ) -> Option<DynSolValue> {
     // genWithDict genDict genDict.constants go t
     // Only looks up in the typed constants map
-    let type_name = sol_type.sol_type_name().to_string();
-    if let Some(constants) = dict.constants.get(&type_name) {
+    let kind = crate::types::ValueKind::from_type(sol_type);
+    if let Some(constants) = dict.constants.get(&kind) {
         if !constants.is_empty() {
             let idx = rng.gen_range(0..constants.len());
             return Some(constants[idx].clone());
@@ -363,15 +367,6 @@ pub fn gen_abi_call_m<R: Rng>(
     name: &str,
     param_types: &[DynSolType],
 ) -> (String, Vec<DynSolValue>) {
-    // Build signature for lookup (must match add_call signature format)
-    let sig = (
-        name.to_string(),
-        param_types
-            .iter()
-            .map(|t| t.sol_type_name().to_string())
-            .collect::<Vec<String>>(),
-    );
-
     // Step 1: Generate fresh arguments FIRST (args <- mapM genAbiValueM)
     // This MUST happen before wholeCalls decision to match RNG consumption order
     let fresh_args: Vec<DynSolValue> = param_types
@@ -383,12 +378,17 @@ pub fn gen_abi_call_m<R: Rng>(
     let use_dict: f32 = rng.gen();
     let should_use_whole_calls = use_dict < dict.dict_freq;
 
-    // Step 3: Optionally lookup whole_calls (maybeValM)
+    // Step 3: Optionally lookup whole_calls (maybeValM) — build sig only when needed
     let sol_call = if should_use_whole_calls {
-        // Try to get a complete call from dictionary
+        let sig = (
+            name.to_string(),
+            param_types
+                .iter()
+                .map(|t| t.sol_type_name().to_string())
+                .collect::<Vec<String>>(),
+        );
         if let Some(calls) = dict.whole_calls.get(&sig) {
             if !calls.is_empty() {
-                // Pick a random successful call from dictionary
                 let idx = rng.gen_range(0..calls.len());
                 Some(calls[idx].clone())
             } else {
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_constants_dict_key_match() {
-        use crate::types::GenDict;
+        use crate::types::{GenDict, ValueKind};
 
         let mut dict = GenDict::new(42);
 
@@ -519,36 +519,27 @@ mod tests {
         let val = DynSolValue::Uint(U256::from(1337), 256);
         dict.add_constants(std::iter::once(val.clone()));
 
-        // Check what key was used (should be plain type name)
-        let key_from_value = val
-            .sol_type_name()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        println!("Key from DynSolValue: {}", key_from_value);
-
-        // Check what key get_from_dict would use (uses DynSolType)
+        // Both should produce ValueKind::Uint(256) — no String allocation for scalars
+        let key_from_value = ValueKind::from_value(&val);
         let ty = DynSolType::Uint(256);
-        let key_from_type = ty.sol_type_name().to_string();
-        println!("Key from DynSolType: {}", key_from_type);
+        let key_from_type = ValueKind::from_type(&ty);
 
-        // They must match!
         assert_eq!(
             key_from_type, key_from_value,
-            "Constants dict key mismatch! add_constants uses '{}' but get_from_dict uses '{}'",
+            "Constants dict key mismatch! add_constants uses {:?} but get_from_dict uses {:?}",
             key_from_value, key_from_type
         );
 
-        // Verify we can actually retrieve the value
         assert!(
             dict.constants.contains_key(&key_from_type),
-            "Constants should contain key '{}'",
+            "Constants should contain key {:?}",
             key_from_type
         );
     }
 
     #[test]
     fn test_tuple_dict_roundtrip() {
-        use crate::types::GenDict;
+        use crate::types::{GenDict, ValueKind};
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let mut dict = GenDict::new(42);
@@ -564,33 +555,29 @@ mod tests {
         // Store it (as campaign.rs would after a successful call)
         dict.add_constants(std::iter::once(tuple_val.clone()));
 
-        // Check the key used for storage
-        let key_from_value = tuple_val
-            .sol_type_name()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        println!("Tuple key from DynSolValue: '{}'", key_from_value);
-
-        // Check the key used for lookup
+        // Both should produce ValueKind::Complex("(uint256,address,bool)")
+        let key_from_value = ValueKind::from_value(&tuple_val);
         let tuple_type = DynSolType::Tuple(vec![
             DynSolType::Uint(256),
             DynSolType::Address,
             DynSolType::Bool,
         ]);
-        let key_from_type = tuple_type.sol_type_name().to_string();
-        println!("Tuple key from DynSolType: '{}'", key_from_type);
+        let key_from_type = ValueKind::from_type(&tuple_type);
+
+        println!("Tuple key from DynSolValue: '{:?}'", key_from_value);
+        println!("Tuple key from DynSolType:  '{:?}'", key_from_type);
 
         // Keys MUST match for roundtrip to work!
         assert_eq!(
             key_from_type, key_from_value,
-            "Tuple dict key mismatch! Storage uses '{}' but lookup uses '{}'",
+            "Tuple dict key mismatch! Storage uses {:?} but lookup uses {:?}",
             key_from_value, key_from_type
         );
 
         // Now verify we can actually retrieve the tuple
         assert!(
             dict.constants.contains_key(&key_from_type),
-            "Constants should contain tuple key '{}'",
+            "Constants should contain tuple key {:?}",
             key_from_type
         );
 
@@ -614,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_nested_tuple_dict_roundtrip() {
-        use crate::types::GenDict;
+        use crate::types::{GenDict, ValueKind};
 
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let mut dict = GenDict::new(42);
@@ -641,14 +628,11 @@ mod tests {
             DynSolType::FixedBytes(32),
         ]);
 
-        let key_from_value = outer_tuple
-            .sol_type_name()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        let key_from_type = outer_type.sol_type_name().to_string();
+        let key_from_value = ValueKind::from_value(&outer_tuple);
+        let key_from_type = ValueKind::from_type(&outer_type);
 
-        println!("Nested tuple value key: '{}'", key_from_value);
-        println!("Nested tuple type key:  '{}'", key_from_type);
+        println!("Nested tuple value key: '{:?}'", key_from_value);
+        println!("Nested tuple type key:  '{:?}'", key_from_type);
 
         assert_eq!(key_from_type, key_from_value, "Nested tuple key mismatch!");
 
