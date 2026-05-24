@@ -48,3 +48,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "execution"
 harness = false
+
+[[bench]]
+name = "shrink_hotpath"
+harness = false

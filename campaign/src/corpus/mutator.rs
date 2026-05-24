@@ -135,6 +135,100 @@ pub fn apply_corpus_mutation<R: Rng>(
     }
 }
 
+/// Weighted selection across two slices (corpus + extras) without
+/// allocating a merged Vec.
+fn select_from_chained<R: Rng>(
+    rng: &mut R,
+    corpus: &[CorpusEntry],
+    extras: &[CorpusEntry],
+) -> Arc<Vec<Tx>> {
+    let combined_len = corpus.len() + extras.len();
+    if combined_len == 0 {
+        return Arc::new(Vec::new());
+    }
+    let total_weight: usize = corpus.iter().chain(extras.iter()).map(|(p, _)| *p).sum();
+    if total_weight == 0 {
+        let idx = rng.gen_range(0..combined_len);
+        return if idx < corpus.len() {
+            corpus[idx].1.clone()
+        } else {
+            extras[idx - corpus.len()].1.clone()
+        };
+    }
+    let mut n = rng.gen_range(0..total_weight);
+    for (priority, txs) in corpus.iter().chain(extras.iter()) {
+        if n < *priority {
+            return txs.clone();
+        }
+        n -= priority;
+    }
+    extras
+        .last()
+        .or(corpus.last())
+        .map(|(_, txs)| txs.clone())
+        .unwrap_or_else(|| Arc::new(Vec::new()))
+}
+
+fn select_and_mutate_chained<R: Rng>(
+    rng: &mut R,
+    mutation: TxsMutation,
+    corpus: &[CorpusEntry],
+    extras: &[CorpusEntry],
+) -> Vec<Tx> {
+    let rtxs = select_from_chained(rng, corpus, extras);
+    if rtxs.is_empty() {
+        return Vec::new();
+    }
+    let k = rng.gen_range(0..rtxs.len());
+    mutator(rng, mutation, &rtxs[..k])
+}
+
+/// Same as apply_corpus_mutation but reads from corpus + extras slices
+/// directly — avoids cloning the full corpus Vec every iteration.
+pub fn apply_corpus_mutation_direct<R: Rng>(
+    rng: &mut R,
+    mutation: CorpusMutation,
+    seq_len: usize,
+    corpus: &[CorpusEntry],
+    extras: &[CorpusEntry],
+    generated_txs: &[Tx],
+) -> Vec<Tx> {
+    match mutation {
+        CorpusMutation::RandomAppend(m) => {
+            let rtxs = select_and_mutate_chained(rng, m, corpus, extras);
+            let mut result = rtxs;
+            result.extend_from_slice(generated_txs);
+            result.truncate(seq_len);
+            result
+        }
+        CorpusMutation::RandomPrepend(m) => {
+            let rtxs = select_and_mutate_chained(rng, m, corpus, extras);
+            let k = if seq_len > 0 { rng.gen_range(0..seq_len) } else { 0 };
+            let k = k.min(generated_txs.len());
+            let mut result: Vec<Tx> = generated_txs[..k].to_vec();
+            result.extend(rtxs);
+            result.truncate(seq_len);
+            result
+        }
+        CorpusMutation::RandomSplice => {
+            let rtxs1 = select_from_chained(rng, corpus, extras);
+            let rtxs2 = select_from_chained(rng, corpus, extras);
+            let mut result = splice_at_random(rng, &rtxs1, &rtxs2);
+            result.extend_from_slice(generated_txs);
+            result.truncate(seq_len);
+            result
+        }
+        CorpusMutation::RandomInterleave => {
+            let rtxs1 = select_from_chained(rng, corpus, extras);
+            let rtxs2 = select_from_chained(rng, corpus, extras);
+            let mut result = interleave_at_random(rng, &rtxs1, &rtxs2);
+            result.extend_from_slice(generated_txs);
+            result.truncate(seq_len);
+            result
+        }
+    }
+}
+
 /// Generate a random corpus mutation (stateful version, for seqLen > 1)
 /// Weights exactly match Echidna to prioritize replaying successful sequences
 pub fn seq_mutators_stateful<R: Rng>(rng: &mut R, consts: MutationConsts) -> CorpusMutation {

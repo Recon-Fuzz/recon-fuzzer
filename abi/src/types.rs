@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 pub struct CachedSet<T: Ord + Clone> {
     set: BTreeSet<T>,
     cache: Vec<T>,
-    dirty: bool,
+    pending: Vec<T>,
 }
 
 impl<T: Ord + Clone> CachedSet<T> {
@@ -27,16 +27,17 @@ impl<T: Ord + Clone> CachedSet<T> {
         Self {
             set: BTreeSet::new(),
             cache: Vec::new(),
-            dirty: false,
+            pending: Vec::new(),
         }
     }
 
     pub fn insert(&mut self, value: T) -> bool {
-        let inserted = self.set.insert(value);
-        if inserted {
-            self.dirty = true;
+        if self.set.insert(value.clone()) {
+            self.pending.push(value);
+            true
+        } else {
+            false
         }
-        inserted
     }
 
     pub fn is_empty(&self) -> bool {
@@ -55,10 +56,9 @@ impl<T: Ord + Clone> CachedSet<T> {
         self.set.contains(value)
     }
 
-    fn rebuild_cache(&mut self) {
-        if self.dirty {
-            self.cache = self.set.iter().cloned().collect();
-            self.dirty = false;
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.cache.append(&mut self.pending);
         }
     }
 
@@ -66,7 +66,7 @@ impl<T: Ord + Clone> CachedSet<T> {
         if self.set.is_empty() {
             return None;
         }
-        self.rebuild_cache();
+        self.flush_pending();
         let idx = rng.gen_range(0..self.cache.len());
         Some(&self.cache[idx])
     }
@@ -74,20 +74,19 @@ impl<T: Ord + Clone> CachedSet<T> {
 
 impl<T: Ord + Clone> Extend<T> for CachedSet<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        let old_len = self.set.len();
-        self.set.extend(iter);
-        if self.set.len() != old_len {
-            self.dirty = true;
+        for value in iter {
+            self.insert(value);
         }
     }
 }
 
 impl<T: Ord + Clone> Clone for CachedSet<T> {
     fn clone(&self) -> Self {
+        let cache: Vec<T> = self.set.iter().cloned().collect();
         Self {
             set: self.set.clone(),
-            cache: self.set.iter().cloned().collect(),
-            dirty: false,
+            cache,
+            pending: Vec::new(),
         }
     }
 }

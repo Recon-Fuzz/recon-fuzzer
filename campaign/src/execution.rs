@@ -576,7 +576,7 @@ pub fn generate_sequence_worker_cached(
     }
 
     use crate::corpus::{
-        apply_corpus_mutation, seq_mutators_stateful, seq_mutators_stateless,
+        apply_corpus_mutation_direct, seq_mutators_stateful, seq_mutators_stateless,
         DEFAULT_MUTATION_CONSTS,
     };
 
@@ -586,29 +586,26 @@ pub fn generate_sequence_worker_cached(
     // more corpus-driven exploration which Echidna proves effective.
     const FRESH_SEQUENCE_PROBABILITY: f64 = 0.10;
 
-    // Corpus uses Arc<Vec<Tx>> - clone is cheap (just ref count increment)
+    // Read corpus under lock without cloning — entries are already in
+    // ascending priority order (ncallseqs increases monotonically).
+    // select_from_corpus uses weighted random selection which is
+    // order-independent, so no sort is needed.
     let corpus = env.corpus_ref.read();
-    let mut corpus_with_priority: Vec<CorpusEntry> = corpus.clone();
+    let base_priority = corpus.last().map(|(p, _)| *p).unwrap_or(0) + 1;
 
-    // Find max priority for optimization test reproducers
-    let base_priority = corpus.iter().map(|(p, _)| *p).max().unwrap_or(0) + 1;
-    drop(corpus);
-
+    // Collect optimization test reproducers (typically 0-2 entries)
+    let mut opt_entries: Vec<CorpusEntry> = Vec::new();
     for (idx, test_ref) in env.test_refs.iter().enumerate() {
         let test = test_ref.read();
         if matches!(test.test_type, crate::testing::TestType::OptimizationTest { .. })
             && !test.reproducer.is_empty()
         {
-            // Wrap reproducer in Arc for consistency with corpus entries
-            corpus_with_priority.push((base_priority + idx, Arc::new(test.reproducer.clone())));
+            opt_entries.push((base_priority + idx, Arc::new(test.reproducer.clone())));
         }
     }
 
-    // Sort by priority in DESCENDING order to match Echidna's Set.toDescList
-    // This ensures newer/higher-priority sequences come first in weighted selection
-    corpus_with_priority.sort_by(|a, b| b.0.cmp(&a.0));
-
-    if corpus_with_priority.is_empty() || rng.gen::<f64>() < FRESH_SEQUENCE_PROBABILITY {
+    if (corpus.is_empty() && opt_entries.is_empty()) || rng.gen::<f64>() < FRESH_SEQUENCE_PROBABILITY {
+        drop(corpus);
         Ok(sequence)
     } else {
         let mutation = if seq_len == 1 {
@@ -616,8 +613,11 @@ pub fn generate_sequence_worker_cached(
         } else {
             seq_mutators_stateful(rng, DEFAULT_MUTATION_CONSTS)
         };
+        // Select and mutate directly from the read-locked corpus,
+        // chaining in opt_entries without cloning the full corpus Vec.
         let mutated_seq =
-            apply_corpus_mutation(rng, mutation, seq_len, &corpus_with_priority, &sequence);
+            apply_corpus_mutation_direct(rng, mutation, seq_len, &corpus, &opt_entries, &sequence);
+        drop(corpus);
         Ok(mutated_seq)
     }
 }
