@@ -12,7 +12,7 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 
 # Async runtime
 tokio.workspace = true
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 futures = "0.3"
 
 # Serialization
@@ -35,8 +35,8 @@ evm.workspace = true
 config.workspace = true
 
 # TLS (self-signed cert for wss:// from HTTPS pages)
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-rcgen = "0.13"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
 rustls-pemfile = "2"

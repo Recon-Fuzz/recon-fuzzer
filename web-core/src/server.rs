@@ -173,7 +173,7 @@ impl<S: Observable + Commandable> WebServer<S> {
                         "  (self-signed cert — browser will need to trust it once at https://{})",
                         tls_addr
                     );
-                    let server = axum_server::bind_rustls(tls_addr.parse().unwrap(), tls_config)
+                    let server = axum_server::bind_rustls(tls_addr.parse::<std::net::SocketAddr>().unwrap(), tls_config)
                         .serve(tls_app.into_make_service());
                     if let Err(e) = server.await {
                         warn!("TLS server error: {}", e);

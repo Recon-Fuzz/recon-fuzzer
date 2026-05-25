@@ -12,7 +12,7 @@ license = "GPL-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-revm = { version = "34.0.0", default-features = false, features = [
+revm = { version = "40.0.2", default-features = false, features = [
     "std",
     "portable",
     "serde",

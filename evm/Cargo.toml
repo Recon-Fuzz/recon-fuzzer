@@ -10,18 +10,18 @@ config.workspace = true
 abi.workspace = true
 
 revm = { workspace = true, features = ["std", "serde"] }
-revm-inspector = "19.0"
-revm-inspectors = { version = "0.39", default-features = false, features = ["std"] }
+revm-inspector = "21.0"
+revm-inspectors = { version = "0.40", default-features = false, features = ["std"] }
 alloy.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 alloy-json-abi.workspace = true
 alloy-dyn-abi.workspace = true
-alloy-provider = { version = "1.7", default-features = false, features = ["reqwest"] }
-alloy-rpc-types = "1.7"
-alloy-transport = "1.7"
-alloy-transport-http = "1.7"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
+alloy-provider = { version = "2.0", default-features = false, features = ["reqwest"] }
+alloy-rpc-types = "2.0"
+alloy-transport = "2.0"
+alloy-transport-http = "2.0"
+reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "blocking", "json"] }
 
 serde.workspace = true
 serde_json.workspace = true
@@ -34,12 +34,12 @@ evmole = "0.8.2"
 rand.workspace = true
 rand_chacha.workspace = true
 parking_lot = "0.12"
-sha3 = "0.10"
+sha3 = "0.12"
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 rustc-hash = "2.1"
-hashbrown = "0.16"
+hashbrown = "0.17"
 dirs = "6.0"
-scraper = { version = "0.20", default-features = false }
+scraper = { version = "0.27", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"
