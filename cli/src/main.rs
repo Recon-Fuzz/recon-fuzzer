@@ -2,6 +2,8 @@
 //!
 //! Smart contract fuzzer executor for Foundry projects.
 
+mod hot_reload;
+
 use anyhow::{Context, Result};
 use campaign::campaign::run_campaign;
 use campaign::config::Env;
@@ -169,6 +171,10 @@ struct FuzzArgs {
     #[arg(long)]
     shrink: bool,
 
+    /// Hot reload: watch .sol files and restart campaign on recompilation
+    #[arg(long)]
+    hot_reload: bool,
+
     /// Convert-only mode: export recon corpus to Echidna format and exit (requires --recon-corpus-dir)
     #[arg(long)]
     convert: bool,
@@ -286,7 +292,11 @@ struct FlatConfig {
     contract_addr: Option<String>,
     deployer: Option<String>,
     sender: Option<Vec<String>>,
-    #[serde(rename = "testLimit", default, deserialize_with = "deserialize_capped_usize")]
+    #[serde(
+        rename = "testLimit",
+        default,
+        deserialize_with = "deserialize_capped_usize"
+    )]
     test_limit: Option<usize>,
     #[serde(rename = "shrinkLimit")]
     shrink_limit: Option<usize>,
@@ -306,10 +316,18 @@ struct FlatConfig {
     #[serde(rename = "mutableOnly")]
     mutable_only: Option<bool>,
     /// Echidna-compatible: initial ETH balance funded into deployer/senders.
-    #[serde(rename = "balanceAddr", default, deserialize_with = "deserialize_u256_opt")]
+    #[serde(
+        rename = "balanceAddr",
+        default,
+        deserialize_with = "deserialize_u256_opt"
+    )]
     balance_addr: Option<U256>,
     /// Echidna-compatible: initial ETH balance of the deployed test contract.
-    #[serde(rename = "balanceContract", default, deserialize_with = "deserialize_u256_opt")]
+    #[serde(
+        rename = "balanceContract",
+        default,
+        deserialize_with = "deserialize_u256_opt"
+    )]
     balance_contract: Option<U256>,
     /// Echidna-compatible: chain id used by the EVM. If unset, defaults to 1
     /// (mainnet) in non-fork mode and to the fork's chain id in fork mode.
@@ -338,6 +356,9 @@ const DEFAULT_WEB_UI_URL: &str = "https://recon-fuzzer.vercel.app";
 /// - Worker N is the "interactive" worker for web UI commands
 ///
 /// The `frontend_url` is always opened with ?ws=ws://localhost:{port}/ws appended.
+/// Sender to shut down a running web server before re-spawning on the same port.
+type WebShutdownTx = tokio::sync::oneshot::Sender<()>;
+
 fn spawn_web_server(
     env: &Env,
     deployed_addresses: Vec<(Address, String)>,
@@ -345,17 +366,13 @@ fn spawn_web_server(
     stop_flag: Option<Arc<AtomicBool>>,
     frontend_url: &str,
     open_browser: bool,
-) -> Result<((), Arc<WebObservableState>)> {
+) -> Result<(WebShutdownTx, Arc<WebObservableState>)> {
     use std::sync::Arc;
 
     let port = port.unwrap_or(4444);
-    // N fuzzing workers + 1 interactive worker for web UI
     let num_fuzzing_workers = env.cfg.campaign_conf.workers as usize;
-    let total_workers = num_fuzzing_workers + 1; // +1 for interactive worker
+    let total_workers = num_fuzzing_workers + 1;
 
-    // Create the observable state wrapper
-    // This clones the Arc references from env, so updates are shared
-    // The last worker (index N) is marked as the interactive worker
     let mut web_state_inner = WebObservableState::new_with_interactive(
         env,
         num_fuzzing_workers,
@@ -363,12 +380,10 @@ fn spawn_web_server(
         deployed_addresses,
     );
 
-    // Set up stop flag if provided
     if let Some(ref flag) = stop_flag {
         web_state_inner.set_stop_flag(flag.clone());
     }
 
-    // Build and spawn the WebSocket server
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -382,23 +397,28 @@ fn spawn_web_server(
         ..Default::default()
     };
 
-    // Create a shared broadcast channel for immediate notifications
     let (broadcast_tx, _) = tokio::sync::broadcast::channel(1024);
     web_state_inner.set_broadcast_sender(broadcast_tx.clone());
 
     let web_state = Arc::new(web_state_inner);
-
-    // Clone for the server (server takes ownership)
     let web_state_for_server = web_state.clone();
 
     let server =
         recon_web::WebServer::new_with_broadcast(web_state_for_server, config, broadcast_tx);
 
-    // Spawn the server in a background thread
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
     std::thread::spawn(move || {
         runtime.block_on(async {
-            if let Err(e) = server.run().await {
-                error!("Web server error: {}", e);
+            tokio::select! {
+                result = server.run() => {
+                    if let Err(e) = result {
+                        error!("Web server error: {}", e);
+                    }
+                }
+                _ = shutdown_rx => {
+                    info!("Web server shutting down for hot reload...");
+                }
             }
         });
     });
@@ -419,7 +439,7 @@ fn spawn_web_server(
         info!("Web UI ready: {} (browser not opened: --no-open)", full_url);
     }
 
-    Ok(((), web_state))
+    Ok((shutdown_tx, web_state))
 }
 
 fn main() -> Result<()> {
@@ -594,6 +614,9 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     if args.shortcuts {
         config.campaign_conf.shortcuts_enable = true;
     }
+    if args.hot_reload {
+        config.campaign_conf.hot_reload = true;
+    }
 
     if let Some(addr_str) = args.contract_addr {
         config.sol_conf.contract_addr = parse_address(&addr_str)?;
@@ -631,462 +654,512 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         config.campaign_conf.corpus_dir = Some(recon_dir);
     }
 
-    // Compile project
-    info!("Compiling project...");
-    let mut project =
-        FoundryProject::compile(&args.project).context("Failed to compile project")?;
-
-    if project.contracts.is_empty() {
-        error!("No contracts found in project");
-        return Ok(());
+    // Set up stop flags for graceful shutdown (before the loop so ctrlc is registered once)
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let force_stop = Arc::new(AtomicBool::new(false));
+    let reload_flag = Arc::new(AtomicBool::new(false));
+    {
+        let stop_flag_clone = stop_flag.clone();
+        let force_stop_clone = force_stop.clone();
+        ctrlc::set_handler(move || {
+            if stop_flag_clone.load(Ordering::Relaxed) {
+                eprintln!("\nReceived second Ctrl+C, stopping immediately...");
+                force_stop_clone.store(true, Ordering::Relaxed);
+            } else {
+                eprintln!(
+                    "\nReceived Ctrl+C, shrinking tests... (press Ctrl+C again to stop immediately)"
+                );
+                stop_flag_clone.store(true, Ordering::Relaxed);
+            }
+        })?;
     }
 
-    info!("Found {} contracts", project.contracts.len());
+    // Spawn hot reload file watcher if enabled
+    let _hot_reload_watcher = if config.campaign_conf.hot_reload {
+        info!("Hot reload enabled: watching for .sol file changes...");
+        Some(hot_reload::spawn_hot_reload_watcher(
+            &args.project,
+            reload_flag.clone(),
+            stop_flag.clone(),
+        )?)
+    } else {
+        None
+    };
 
-    // Find main contract
-    let mut main_contract = find_contract(&project.contracts, args.contract.as_deref())
-        .context("Contract not found")?
-        .clone();
+    let web_mode = args.web.is_some();
+    let mut web_shutdown: Option<WebShutdownTx> = None;
 
-    info!("Fuzzing contract: {}", main_contract.name);
+    // === Hot reload loop ===
+    // On first iteration: compile + fuzz. On subsequent iterations (hot reload):
+    // forge build already ran in watcher thread, so recompile is a no-op.
+    let mut is_reload = false;
+    'hot_reload: loop {
+        if is_reload {
+            info!("Hot reload: reinitializing campaign with new bytecode...");
+        }
 
-    // Snapshot of `out/build-info/` taken AFTER slither runs (success or
-    // failure path) so coverage reports read from a frozen copy rather
-    // than the live `out/` directory. A concurrent `forge build` during
-    // the campaign would otherwise corrupt the final report.
-    // `snapshot_build_info` wipes any prior snapshot dir on each call,
-    // so this also cleans up stale snapshots from previous runs.
-    let mut build_info_snapshot_dir: Option<PathBuf> = None;
+        // Compile project
+        info!("Compiling project...");
+        let mut project =
+            FoundryProject::compile(&args.project).context("Failed to compile project")?;
 
-    // Load slither/recon-generate info for source analysis 
-    // This provides precise constants from source code analysis
-    let project_path = args.project.to_string_lossy();
-    let slither_info = match analysis::slither::SlitherInfo::load_from_recon_generate(
-        &project_path,
-        &main_contract.name,
-    ) {
-        Ok(info) => {
-            let constants_count: usize = info
-                .constants_used
-                .values()
-                .map(|funcs| funcs.values().map(|v| v.len()).sum::<usize>())
-                .sum();
-            info!(
-                "Loaded slither info: {} functions with {} constants",
-                info.constants_used.values().map(|f| f.len()).sum::<usize>(),
-                constants_count
-            );
+        if project.contracts.is_empty() {
+            error!("No contracts found in project");
+            return Ok(());
+        }
 
-            // Auto-adjust max_time_delay and max_block_delay based on constants
-            // This allows reaching exact timestamps/blocks found in source code
-            let required_delays = analysis::slither::calculate_required_delays(&info);
-            if required_delays.max_time_delay > config.tx_conf.max_time_delay {
+        info!("Found {} contracts", project.contracts.len());
+
+        // Find main contract
+        let mut main_contract = find_contract(&project.contracts, args.contract.as_deref())
+            .context("Contract not found")?
+            .clone();
+
+        info!("Fuzzing contract: {}", main_contract.name);
+
+        // Snapshot of `out/build-info/` taken AFTER slither runs (success or
+        // failure path) so coverage reports read from a frozen copy rather
+        // than the live `out/` directory. A concurrent `forge build` during
+        // the campaign would otherwise corrupt the final report.
+        // `snapshot_build_info` wipes any prior snapshot dir on each call,
+        // so this also cleans up stale snapshots from previous runs.
+        let mut build_info_snapshot_dir: Option<PathBuf> = None;
+
+        // Load slither/recon-generate info for source analysis
+        // This provides precise constants from source code analysis
+        let project_path = args.project.to_string_lossy();
+        let slither_info = match analysis::slither::SlitherInfo::load_from_recon_generate(
+            &project_path,
+            &main_contract.name,
+        ) {
+            Ok(info) => {
+                let constants_count: usize = info
+                    .constants_used
+                    .values()
+                    .map(|funcs| funcs.values().map(|v| v.len()).sum::<usize>())
+                    .sum();
                 info!(
-                    "Auto-adjusting max_time_delay: {} -> {} (to reach timestamp constants)",
-                    config.tx_conf.max_time_delay, required_delays.max_time_delay
+                    "Loaded slither info: {} functions with {} constants",
+                    info.constants_used.values().map(|f| f.len()).sum::<usize>(),
+                    constants_count
                 );
-                config.tx_conf.max_time_delay = required_delays.max_time_delay;
-            }
-            if required_delays.max_block_delay > config.tx_conf.max_block_delay {
-                info!(
+
+                // Auto-adjust max_time_delay and max_block_delay based on constants
+                // This allows reaching exact timestamps/blocks found in source code
+                let required_delays = analysis::slither::calculate_required_delays(&info);
+                if required_delays.max_time_delay > config.tx_conf.max_time_delay {
+                    info!(
+                        "Auto-adjusting max_time_delay: {} -> {} (to reach timestamp constants)",
+                        config.tx_conf.max_time_delay, required_delays.max_time_delay
+                    );
+                    config.tx_conf.max_time_delay = required_delays.max_time_delay;
+                }
+                if required_delays.max_block_delay > config.tx_conf.max_block_delay {
+                    info!(
                     "Auto-adjusting max_block_delay: {} -> {} (to reach block number constants)",
                     config.tx_conf.max_block_delay, required_delays.max_block_delay
                 );
-                config.tx_conf.max_block_delay = required_delays.max_block_delay;
-            }
-
-            Some(info)
-        }
-        Err(e) => {
-            // Retry: rebuild with --build-info and try again
-            let build_info_dir = args.project.join("out").join("build-info");
-
-            // Delete build-info if it exists (may be corrupted)
-            if build_info_dir.exists() {
-                info!("recon-generate info failed, removing build-info...");
-                if let Err(rm_err) = std::fs::remove_dir_all(&build_info_dir) {
-                    warn!("Failed to remove build-info: {}", rm_err);
+                    config.tx_conf.max_block_delay = required_delays.max_block_delay;
                 }
+
+                Some(info)
             }
+            Err(e) => {
+                // Retry: rebuild with --build-info and try again
+                let build_info_dir = args.project.join("out").join("build-info");
 
-            // Rebuild project with --build-info
-            info!("Rebuilding project with --build-info...");
-            let rebuild_result = std::process::Command::new("forge")
-                .arg("build")
-                .arg("--build-info")
-                .arg("-o")
-                .arg("out")
-                .current_dir(&args.project)
-                .output();
+                // Delete build-info if it exists (may be corrupted)
+                if build_info_dir.exists() {
+                    info!("recon-generate info failed, removing build-info...");
+                    if let Err(rm_err) = std::fs::remove_dir_all(&build_info_dir) {
+                        warn!("Failed to remove build-info: {}", rm_err);
+                    }
+                }
 
-            match rebuild_result {
-                Ok(output) if output.status.success() => {
-                    // Retry recon-generate info
-                    match analysis::slither::SlitherInfo::load_from_recon_generate(
-                        &project_path,
-                        &main_contract.name,
-                    ) {
-                        Ok(info) => {
-                            info!("recon-generate info succeeded on retry");
-                            let constants_count: usize = info
-                                .constants_used
-                                .values()
-                                .map(|funcs| funcs.values().map(|v| v.len()).sum::<usize>())
-                                .sum();
-                            info!(
-                                "Loaded slither info: {} functions with {} constants",
-                                info.constants_used.values().map(|f| f.len()).sum::<usize>(),
-                                constants_count
-                            );
+                // Rebuild project with --build-info
+                info!("Rebuilding project with --build-info...");
+                let rebuild_result = std::process::Command::new("forge")
+                    .arg("build")
+                    .arg("--build-info")
+                    .arg("-o")
+                    .arg("out")
+                    .current_dir(&args.project)
+                    .output();
 
-                            // Auto-adjust max_time_delay and max_block_delay based on constants
-                            let required_delays =
-                                analysis::slither::calculate_required_delays(&info);
-                            if required_delays.max_time_delay > config.tx_conf.max_time_delay {
+                match rebuild_result {
+                    Ok(output) if output.status.success() => {
+                        // Retry recon-generate info
+                        match analysis::slither::SlitherInfo::load_from_recon_generate(
+                            &project_path,
+                            &main_contract.name,
+                        ) {
+                            Ok(info) => {
+                                info!("recon-generate info succeeded on retry");
+                                let constants_count: usize = info
+                                    .constants_used
+                                    .values()
+                                    .map(|funcs| funcs.values().map(|v| v.len()).sum::<usize>())
+                                    .sum();
                                 info!(
+                                    "Loaded slither info: {} functions with {} constants",
+                                    info.constants_used.values().map(|f| f.len()).sum::<usize>(),
+                                    constants_count
+                                );
+
+                                // Auto-adjust max_time_delay and max_block_delay based on constants
+                                let required_delays =
+                                    analysis::slither::calculate_required_delays(&info);
+                                if required_delays.max_time_delay > config.tx_conf.max_time_delay {
+                                    info!(
                                     "Auto-adjusting max_time_delay: {} -> {} (to reach timestamp constants)",
                                     config.tx_conf.max_time_delay, required_delays.max_time_delay
                                 );
-                                config.tx_conf.max_time_delay = required_delays.max_time_delay;
-                            }
-                            if required_delays.max_block_delay > config.tx_conf.max_block_delay {
-                                info!(
+                                    config.tx_conf.max_time_delay = required_delays.max_time_delay;
+                                }
+                                if required_delays.max_block_delay > config.tx_conf.max_block_delay
+                                {
+                                    info!(
                                     "Auto-adjusting max_block_delay: {} -> {} (to reach block number constants)",
                                     config.tx_conf.max_block_delay, required_delays.max_block_delay
                                 );
-                                config.tx_conf.max_block_delay = required_delays.max_block_delay;
-                            }
+                                    config.tx_conf.max_block_delay =
+                                        required_delays.max_block_delay;
+                                }
 
-                            Some(info)
-                        }
-                        Err(retry_err) => {
-                            warn!("Failed to load slither info: {}. Fuzzing will continue with bytecode constants only.", retry_err);
-                            None
+                                Some(info)
+                            }
+                            Err(retry_err) => {
+                                warn!("Failed to load slither info: {}. Fuzzing will continue with bytecode constants only.", retry_err);
+                                None
+                            }
                         }
                     }
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!("forge build --build-info failed: {}. Fuzzing will continue with bytecode constants only.", stderr);
-                    None
-                }
-                Err(rebuild_err) => {
-                    warn!("Failed to run forge build: {}. Original error: {}. Fuzzing will continue with bytecode constants only.", rebuild_err, e);
-                    None
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        warn!("forge build --build-info failed: {}. Fuzzing will continue with bytecode constants only.", stderr);
+                        None
+                    }
+                    Err(rebuild_err) => {
+                        warn!("Failed to run forge build: {}. Original error: {}. Fuzzing will continue with bytecode constants only.", rebuild_err, e);
+                        None
+                    }
                 }
             }
+        };
+
+        // Snapshot `out/build-info/` after slither has run (both success and
+        // failure paths converge here). Coverage reports — final and any
+        // periodic LCOV writes — read from this frozen copy instead of the
+        // live dir, so a concurrent `forge build` during the campaign can't
+        // corrupt them. `snapshot_build_info` wipes any prior snapshot on
+        // each call, so this also cleans up stale dirs from previous runs.
+        if let Some(corpus_dir) = config.campaign_conf.corpus_dir.as_ref() {
+            match evm::coverage::snapshot_build_info(&args.project, corpus_dir) {
+                Ok(snap) => build_info_snapshot_dir = snap,
+                Err(e) => warn!("Failed to snapshot build-info: {}", e),
+            }
         }
-    };
 
-    // Snapshot `out/build-info/` after slither has run (both success and
-    // failure paths converge here). Coverage reports — final and any
-    // periodic LCOV writes — read from this frozen copy instead of the
-    // live dir, so a concurrent `forge build` during the campaign can't
-    // corrupt them. `snapshot_build_info` wipes any prior snapshot on
-    // each call, so this also cleans up stale dirs from previous runs.
-    if let Some(corpus_dir) = config.campaign_conf.corpus_dir.as_ref() {
-        match evm::coverage::snapshot_build_info(&args.project, corpus_dir) {
-            Ok(snap) => build_info_snapshot_dir = snap,
-            Err(e) => warn!("Failed to snapshot build-info: {}", e),
+        // Set exclude_from_fuzzing from slither info if available
+        if let Some(ref info) = slither_info {
+            let excluded = info.get_excluded_functions();
+            if !excluded.is_empty() {
+                info!(
+                    "Excluding {} functions from fuzzing: {:?}",
+                    excluded.len(),
+                    excluded
+                );
+                main_contract.exclude_from_fuzzing = excluded.to_vec();
+            }
         }
-    }
 
-    // Set exclude_from_fuzzing from slither info if available
-    if let Some(ref info) = slither_info {
-        let excluded = info.get_excluded_functions();
-        if !excluded.is_empty() {
-            info!(
-                "Excluding {} functions from fuzzing: {:?}",
-                excluded.len(),
-                excluded
-            );
-            main_contract.exclude_from_fuzzing = excluded.to_vec();
-        }
-    }
+        // Discover tests based on test mode (createTests)
+        let prefix = &config.sol_conf.prefix;
+        // Filter functions manually as CompiledContract doesn't have functions_by_name
+        let echidna_funcs: Vec<&alloy_json_abi::Function> = main_contract
+            .abi
+            .functions()
+            .filter(|f| f.name.starts_with(prefix))
+            .collect();
 
-    // Discover tests based on test mode (createTests)
-    let prefix = &config.sol_conf.prefix;
-    // Filter functions manually as CompiledContract doesn't have functions_by_name
-    let echidna_funcs: Vec<&alloy_json_abi::Function> = main_contract
-        .abi
-        .functions()
-        .filter(|f| f.name.starts_with(prefix))
-        .collect();
+        let fuzzable_funcs = main_contract.fuzzable_functions(config.sol_conf.mutable_only);
 
-    let fuzzable_funcs = main_contract.fuzzable_functions(config.sol_conf.mutable_only);
-
-    info!(
-        "Found {} tests with prefix '{}'",
-        echidna_funcs.len(),
-        prefix
-    );
-
-    // Show smart-filtered count if slither info is available
-    // In assertion mode, we ONLY want to fuzz/test functions that have assertions
-    // or can affect state (non-view/pure functions)
-    let assert_functions: std::collections::HashSet<String> = slither_info
-        .as_ref()
-        .map(|info| {
-            info.assert_functions(&main_contract.name)
-                .into_iter()
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Use smart filtering if we have assertion info, otherwise use all fuzzable
-    let fuzzable_sigs: Vec<(String, Vec<String>)> = if !assert_functions.is_empty() {
-        let smart_fuzzable =
-            main_contract.fuzzable_functions_smart(config.sol_conf.mutable_only, &assert_functions);
         info!(
+            "Found {} tests with prefix '{}'",
+            echidna_funcs.len(),
+            prefix
+        );
+
+        // Show smart-filtered count if slither info is available
+        // In assertion mode, we ONLY want to fuzz/test functions that have assertions
+        // or can affect state (non-view/pure functions)
+        let assert_functions: std::collections::HashSet<String> = slither_info
+            .as_ref()
+            .map(|info| {
+                info.assert_functions(&main_contract.name)
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Use smart filtering if we have assertion info, otherwise use all fuzzable
+        let fuzzable_sigs: Vec<(String, Vec<String>)> = if !assert_functions.is_empty() {
+            let smart_fuzzable = main_contract
+                .fuzzable_functions_smart(config.sol_conf.mutable_only, &assert_functions);
+            info!(
             "Found {} fuzzable functions (smart filtered from {} total, {} view/pure with assertions)",
             smart_fuzzable.len(),
             fuzzable_funcs.len(),
             assert_functions.len()
         );
-        smart_fuzzable
-            .iter()
-            .map(|f| {
-                (
-                    f.name.clone(),
-                    // Use resolve() to get full type like "(uint128,uint128,uint128)" for tuples
-                    // instead of just "tuple" from p.ty
-                    f.inputs
-                        .iter()
-                        .filter_map(|p| {
-                            use alloy_dyn_abi::Specifier;
-                            p.resolve().ok().map(|t| t.sol_type_name().to_string())
-                        })
-                        .collect(),
-                )
-            })
-            .collect()
-    } else {
-        info!("Found {} fuzzable functions", fuzzable_funcs.len());
-        fuzzable_funcs
-            .iter()
-            .map(|f| {
-                (
-                    f.name.clone(),
-                    // Use resolve() to get full type like "(uint128,uint128,uint128)" for tuples
-                    // instead of just "tuple" from p.ty
-                    f.inputs
-                        .iter()
-                        .filter_map(|p| {
-                            use alloy_dyn_abi::Specifier;
-                            p.resolve().ok().map(|t| t.sol_type_name().to_string())
-                        })
-                        .collect(),
-                )
-            })
-            .collect()
-    };
-
-    // Create environment
-    let mut env = Env::new(config, project.contracts.clone());
-    env.main_contract = Some(main_contract.clone());
-    env.slither_info = slither_info;
-    env.build_info_snapshot_dir = build_info_snapshot_dir;
-
-    // Set up --repro writer if specified
-    if let Some(ref repro_path) = args.repro {
-        let abs_path = if repro_path.is_absolute() {
-            repro_path.clone()
+            smart_fuzzable
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        // Use resolve() to get full type like "(uint128,uint128,uint128)" for tuples
+                        // instead of just "tuple" from p.ty
+                        f.inputs
+                            .iter()
+                            .filter_map(|p| {
+                                use alloy_dyn_abi::Specifier;
+                                p.resolve().ok().map(|t| t.sol_type_name().to_string())
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
         } else {
-            args.project.join(repro_path)
+            info!("Found {} fuzzable functions", fuzzable_funcs.len());
+            fuzzable_funcs
+                .iter()
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        // Use resolve() to get full type like "(uint128,uint128,uint128)" for tuples
+                        // instead of just "tuple" from p.ty
+                        f.inputs
+                            .iter()
+                            .filter_map(|p| {
+                                use alloy_dyn_abi::Specifier;
+                                p.resolve().ok().map(|t| t.sol_type_name().to_string())
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
         };
-        if !abs_path.exists() {
-            anyhow::bail!(
+
+        // Create environment
+        let mut env = Env::new(config.clone(), project.contracts.clone());
+        env.main_contract = Some(main_contract.clone());
+        env.slither_info = slither_info;
+        env.build_info_snapshot_dir = build_info_snapshot_dir;
+
+        // Set up --repro writer if specified
+        if let Some(ref repro_path) = args.repro {
+            let abs_path = if repro_path.is_absolute() {
+                repro_path.clone()
+            } else {
+                args.project.join(repro_path)
+            };
+            if !abs_path.exists() {
+                anyhow::bail!(
                 "--repro file does not exist: {}. Create a CryticToFoundry-style .sol file first.",
                 abs_path.display()
             );
+            }
+            info!("Foundry repro output: {}", abs_path.display());
+            let abi = env.main_contract.as_ref().map(|c| c.abi.clone());
+            env.repro_writer = Some(campaign::repro::ReproWriter::new(abs_path, abi));
         }
-        info!("Foundry repro output: {}", abs_path.display());
-        let abi = env.main_contract.as_ref().map(|c| c.abi.clone());
-        env.repro_writer = Some(campaign::repro::ReproWriter::new(abs_path, abi));
-    }
 
-    // Populate view_pure_functions for shrinking optimization
-    // These functions don't modify state, so they can be replaced with NoCall during shrinking
-    use alloy_json_abi::StateMutability;
-    for func in main_contract.abi.functions() {
-        if matches!(
-            func.state_mutability,
-            StateMutability::View | StateMutability::Pure
-        ) {
-            env.world.view_pure_functions.insert(func.name.clone());
-        }
-        // Track payable functions for value generation
-        if matches!(func.state_mutability, StateMutability::Payable) {
-            let selector = func.selector();
-            info!(
-                "Payable function detected: {} (selector: 0x{})",
-                func.name,
-                hex::encode(selector.as_slice())
-            );
-            env.world.payable_sigs.push(selector);
-        }
-    }
-    if !env.world.view_pure_functions.is_empty() {
-        info!(
-            "Found {} view/pure functions (will be removed during shrinking)",
-            env.world.view_pure_functions.len()
-        );
-    }
-    if !env.world.payable_sigs.is_empty() {
-        info!(
-            "Found {} payable functions (will receive non-zero msg.value)",
-            env.world.payable_sigs.len()
-        );
-    } else {
-        info!("No payable functions found - all transactions will have value=0");
-    }
-
-    // NOTE: Tests will be created AFTER deployment so they use the actual deployed address
-
-    // Initialize EVM - use fork mode if RPC URL is provided
-    let mut vm = if let Some(ref rpc_url) = env.cfg.rpc_url {
-        info!(
-            "Initializing fork mode from RPC: {} at block {:?}",
-            rpc_url, env.cfg.rpc_block
-        );
-        match EvmState::new_fork(rpc_url, env.cfg.rpc_block, evm::fork::ForkOptions::default()) {
-            Ok(fork_vm) => {
+        // Populate view_pure_functions for shrinking optimization
+        // These functions don't modify state, so they can be replaced with NoCall during shrinking
+        use alloy_json_abi::StateMutability;
+        for func in main_contract.abi.functions() {
+            if matches!(
+                func.state_mutability,
+                StateMutability::View | StateMutability::Pure
+            ) {
+                env.world.view_pure_functions.insert(func.name.clone());
+            }
+            // Track payable functions for value generation
+            if matches!(func.state_mutability, StateMutability::Payable) {
+                let selector = func.selector();
                 info!(
-                    "Fork initialized: chain_id={}, rpc_calls={}",
-                    fork_vm.chain_id(),
-                    fork_vm.db.rpc_call_count()
+                    "Payable function detected: {} (selector: 0x{})",
+                    func.name,
+                    hex::encode(selector.as_slice())
                 );
-                // Prefer the corpus-dir-scoped RPC cache (echidna format,
-                // checked into the project). The default chain-scoped cache
-                // was already loaded inside ForkableDb::new_fork.
-                if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
-                    match fork_vm.load_fork_cache_from_dir(corpus_dir) {
-                        Ok(true) => info!("Loaded RPC cache from corpus dir {:?}", corpus_dir),
-                        Ok(false) => {}
-                        Err(e) => tracing::warn!(
-                            "Failed to load RPC cache from corpus dir {:?}: {}",
-                            corpus_dir,
-                            e
-                        ),
-                    }
-                }
-                fork_vm
-            }
-            Err(e) => {
-                error!("Failed to initialize fork: {}", e);
-                error!("Falling back to empty database (external calls will fail!)");
-                EvmState::new()
+                env.world.payable_sigs.push(selector);
             }
         }
-    } else {
-        EvmState::new()
-    };
+        if !env.world.view_pure_functions.is_empty() {
+            info!(
+                "Found {} view/pure functions (will be removed during shrinking)",
+                env.world.view_pure_functions.len()
+            );
+        }
+        if !env.world.payable_sigs.is_empty() {
+            info!(
+                "Found {} payable functions (will receive non-zero msg.value)",
+                env.world.payable_sigs.len()
+            );
+        } else {
+            info!("No payable functions found - all transactions will have value=0");
+        }
 
-    // Set coverage mode (branch mode is faster but less granular)
-    vm.set_coverage_mode(evm::coverage::CoverageMode::from_str(
-        &env.cfg.campaign_conf.coverage_mode,
-    ));
+        // NOTE: Tests will be created AFTER deployment so they use the actual deployed address
 
-    // Apply `chainId` from config if set (overrides the fork's chain id /
-    // mainnet default). Mirrors echidna's `chainId` knob; can also be
-    // changed at runtime via `vm.chainId(uint256)`.
-    if let Some(cid) = env.cfg.sol_conf.chain_id {
-        vm.chain_id = cid;
-    }
+        // Initialize EVM - use fork mode if RPC URL is provided
+        let mut vm = if let Some(ref rpc_url) = env.cfg.rpc_url {
+            info!(
+                "Initializing fork mode from RPC: {} at block {:?}",
+                rpc_url, env.cfg.rpc_block
+            );
+            match EvmState::new_fork(
+                rpc_url,
+                env.cfg.rpc_block,
+                evm::fork::ForkOptions::default(),
+            ) {
+                Ok(fork_vm) => {
+                    info!(
+                        "Fork initialized: chain_id={}, rpc_calls={}",
+                        fork_vm.chain_id(),
+                        fork_vm.db.rpc_call_count()
+                    );
+                    // Prefer the corpus-dir-scoped RPC cache (echidna format,
+                    // checked into the project). The default chain-scoped cache
+                    // was already loaded inside ForkableDb::new_fork.
+                    if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
+                        match fork_vm.load_fork_cache_from_dir(corpus_dir) {
+                            Ok(true) => info!("Loaded RPC cache from corpus dir {:?}", corpus_dir),
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!(
+                                "Failed to load RPC cache from corpus dir {:?}: {}",
+                                corpus_dir,
+                                e
+                            ),
+                        }
+                    }
+                    fork_vm
+                }
+                Err(e) => {
+                    error!("Failed to initialize fork: {}", e);
+                    error!("Falling back to empty database (external calls will fail!)");
+                    EvmState::new()
+                }
+            }
+        } else {
+            EvmState::new()
+        };
 
-    // Fund deployer and senders. If `balanceAddr` is set in config, honor it
-    // exactly (echidna semantics, default 0xffffffff). Otherwise fund with
-    // U256::MAX/2 to avoid funding issues during long campaigns.
-    let deployer = env.cfg.sol_conf.deployer;
-    let _contract_addr = env.cfg.sol_conf.contract_addr;
+        // Set coverage mode (branch mode is faster but less granular)
+        vm.set_coverage_mode(evm::coverage::CoverageMode::from_str(
+            &env.cfg.campaign_conf.coverage_mode,
+        ));
 
-    let funding = env
-        .cfg
-        .sol_conf
-        .balance_addr
-        .unwrap_or_else(|| U256::MAX / U256::from(2));
+        // Apply `chainId` from config if set (overrides the fork's chain id /
+        // mainnet default). Mirrors echidna's `chainId` knob; can also be
+        // changed at runtime via `vm.chainId(uint256)`.
+        if let Some(cid) = env.cfg.sol_conf.chain_id {
+            vm.chain_id = cid;
+        }
 
-    vm.fund_account(deployer, funding);
-    for sender in &env.cfg.sol_conf.sender {
-        vm.fund_account(*sender, funding);
-    }
+        // Fund deployer and senders. If `balanceAddr` is set in config, honor it
+        // exactly (echidna semantics, default 0xffffffff). Otherwise fund with
+        // U256::MAX/2 to avoid funding issues during long campaigns.
+        let deployer = env.cfg.sol_conf.deployer;
+        let _contract_addr = env.cfg.sol_conf.contract_addr;
 
-    // Deploy contract at configured address 
-    // Echidna deploys contracts at a specific address from config
-    let target_addr = env.cfg.sol_conf.contract_addr;
-    info!(
-        "Deploying contract at configured address: {:?}",
-        target_addr
-    );
+        let funding = env
+            .cfg
+            .sol_conf
+            .balance_addr
+            .unwrap_or_else(|| U256::MAX / U256::from(2));
 
-    // Log constructor and bytecode info
-    println!("Bytecode length: {} bytes", main_contract.bytecode.len());
-    println!(
-        "Deployed bytecode length: {} bytes",
-        main_contract.deployed_bytecode.len()
-    );
+        vm.fund_account(deployer, funding);
+        for sender in &env.cfg.sol_conf.sender {
+            vm.fund_account(*sender, funding);
+        }
 
-    // Print first 64 bytes of bytecode for debugging
-    println!(
-        "Bytecode prefix (first 64 bytes): 0x{}",
-        hex::encode(&main_contract.bytecode[..64.min(main_contract.bytecode.len())])
-    );
-
-    if let Some(constructor) = main_contract.abi.constructor() {
-        println!(
-            "Constructor has {} inputs: {:?}",
-            constructor.inputs.len(),
-            constructor
-                .inputs
-                .iter()
-                .map(|p| format!("{} {}", p.ty, p.name))
-                .collect::<Vec<_>>()
+        // Deploy contract at configured address
+        // Echidna deploys contracts at a specific address from config
+        let target_addr = env.cfg.sol_conf.contract_addr;
+        info!(
+            "Deploying contract at configured address: {:?}",
+            target_addr
         );
-        if !constructor.inputs.is_empty() {
-            return Err(anyhow::anyhow!(
+
+        // Log constructor and bytecode info
+        println!("Bytecode length: {} bytes", main_contract.bytecode.len());
+        println!(
+            "Deployed bytecode length: {} bytes",
+            main_contract.deployed_bytecode.len()
+        );
+
+        // Print first 64 bytes of bytecode for debugging
+        println!(
+            "Bytecode prefix (first 64 bytes): 0x{}",
+            hex::encode(&main_contract.bytecode[..64.min(main_contract.bytecode.len())])
+        );
+
+        if let Some(constructor) = main_contract.abi.constructor() {
+            println!(
+                "Constructor has {} inputs: {:?}",
+                constructor.inputs.len(),
+                constructor
+                    .inputs
+                    .iter()
+                    .map(|p| format!("{} {}", p.ty, p.name))
+                    .collect::<Vec<_>>()
+            );
+            if !constructor.inputs.is_empty() {
+                return Err(anyhow::anyhow!(
                 "Constructor has {} parameters but constructor arguments are not yet supported. \
                 Consider using a setUp() function to initialize state instead.",
                 constructor.inputs.len()
             ));
+            }
+        } else {
+            println!("Contract has no constructor (or empty constructor)");
         }
-    } else {
-        println!("Contract has no constructor (or empty constructor)");
-    }
 
-    // Deploy with automatic library linking. The constructor msg.value is the
-    // configured `balanceContract` (echidna semantics), so `address(this).balance`
-    // and any payable constructor logic see the intended starting funds.
-    // Pass init coverage ref to track constructor coverage (init bytecode, not runtime).
-    // Returns traces from constructor execution for dictionary extraction.
-    let balance_contract = env.cfg.sol_conf.balance_contract;
-    if balance_contract > U256::ZERO {
-        info!(
-            "Sending balanceContract={} wei as msg.value to constructor",
-            balance_contract
+        // Deploy with automatic library linking. The constructor msg.value is the
+        // configured `balanceContract` (echidna semantics), so `address(this).balance`
+        // and any payable constructor logic see the intended starting funds.
+        // Pass init coverage ref to track constructor coverage (init bytecode, not runtime).
+        // Returns traces from constructor execution for dictionary extraction.
+        let balance_contract = env.cfg.sol_conf.balance_contract;
+        if balance_contract > U256::ZERO {
+            info!(
+                "Sending balanceContract={} wei as msg.value to constructor",
+                balance_contract
+            );
+        }
+        let (deployed_addr, constructor_traces) = deploy_with_linking_and_value(
+            &mut vm,
+            &mut project,
+            &main_contract.name,
+            deployer,
+            target_addr,
+            balance_contract,
+            &env.coverage_ref_init,
+            &env.codehash_map,
+        )?;
+
+        info!("Contract deployed at: {:?}", deployed_addr);
+
+        // Extract dictionary values from constructor traces
+        // This captures struct values passed to external calls and event parameters
+        // during constructor execution (e.g., createMarket(MarketParams{...}))
+        let constructor_extracted = campaign::execution::extract_values_from_traces(
+            &constructor_traces,
+            &env.event_map,
+            &env.function_map,
         );
-    }
-    let (deployed_addr, constructor_traces) = deploy_with_linking_and_value(
-        &mut vm,
-        &mut project,
-        &main_contract.name,
-        deployer,
-        target_addr,
-        balance_contract,
-        &env.coverage_ref_init,
-        &env.codehash_map,
-    )?;
-
-    info!("Contract deployed at: {:?}", deployed_addr);
-
-    // Extract dictionary values from constructor traces
-    // This captures struct values passed to external calls and event parameters
-    // during constructor execution (e.g., createMarket(MarketParams{...}))
-    let constructor_extracted = campaign::execution::extract_values_from_traces(
-        &constructor_traces,
-        &env.event_map,
-        &env.function_map,
-    );
-    info!(
+        info!(
         "Constructor dictionary extraction: {} uint values, {} addresses, {} signed values, {} tuples",
         constructor_extracted.uint_values.len(),
         constructor_extracted.addresses.len(),
@@ -1094,556 +1167,546 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         constructor_extracted.tuples.len()
     );
 
-    // Seed env with constructor-extracted values
-    env.setup_dict_values = constructor_extracted.uint_values;
-    env.setup_dict_addresses = constructor_extracted.addresses;
-    env.setup_dict_signed = constructor_extracted.int_values;
-    env.setup_dict_tuples = constructor_extracted.tuples;
+        // Seed env with constructor-extracted values
+        env.setup_dict_values = constructor_extracted.uint_values;
+        env.setup_dict_addresses = constructor_extracted.addresses;
+        env.setup_dict_signed = constructor_extracted.int_values;
+        env.setup_dict_tuples = constructor_extracted.tuples;
 
-    // Track deployed addresses for trace decoding (main contract + libraries)
-    let mut deployed_addresses: Vec<(alloy_primitives::Address, String)> =
-        vec![(deployed_addr, main_contract.name.clone())];
-    // Add library addresses
-    deployed_addresses.extend(project.get_deployed_library_addresses());
+        // Track deployed addresses for trace decoding (main contract + libraries)
+        let mut deployed_addresses: Vec<(alloy_primitives::Address, String)> =
+            vec![(deployed_addr, main_contract.name.clone())];
+        // Add library addresses
+        deployed_addresses.extend(project.get_deployed_library_addresses());
 
-    // Run setUp if present and track any contracts created during setUp
-    // (In some projects, setUp is separate from constructor; in others like Echidna
-    // the setUp logic runs in the constructor, which we already handled above)
-    if main_contract.has_setup() {
-        info!("Running setUp()...");
-        let setup_tx = evm::types::Tx::call("setUp", vec![], deployer, deployed_addr, (0, 0));
+        // Run setUp if present and track any contracts created during setUp
+        // (In some projects, setUp is separate from constructor; in others like Echidna
+        // the setUp logic runs in the constructor, which we already handled above)
+        if main_contract.has_setup() {
+            info!("Running setUp()...");
+            let setup_tx = evm::types::Tx::call("setUp", vec![], deployer, deployed_addr, (0, 0));
 
-        // Run setUp with tracing to capture created contracts
-        match vm.exec_tx_with_revm_tracing(&setup_tx) {
-            Ok((_result, traces, _storage_changes, _storage_reads, _output, _logs, pcs)) => {
-                // Merge setUp coverage into BOTH init and runtime coverage maps.
-                // setUp typically only CALLs already-deployed contracts, so PCs carry
-                // *runtime* codehashes (keccak256 of deployed bytecode). But setUp may
-                // also CREATE new contracts, producing PCs with *init* codehashes.
-                // Each report-generation pass uses its own codehash-keyed lookup
-                // (runtime_source_info vs init_source_info), so writing to both maps
-                // does not double-count: a given codehash matches only one of them.
-                if !pcs.is_empty() {
-                    let mut init_cov = env.coverage_ref_init.write();
-                    let mut runtime_cov = env.coverage_ref_runtime.write();
-                    for (codehash, pc) in &pcs {
-                        for cov in [&mut *init_cov, &mut *runtime_cov] {
-                            let contract_cov = cov.entry(*codehash).or_default();
-                            let entry = contract_cov.entry(*pc).or_insert((0, 0));
-                            entry.0 |= 1; // Mark as covered at depth 0
-                            entry.1 |= 1; // Mark as successful execution
+            // Run setUp with tracing to capture created contracts
+            match vm.exec_tx_with_revm_tracing(&setup_tx) {
+                Ok((_result, traces, _storage_changes, _storage_reads, _output, _logs, pcs)) => {
+                    // Merge setUp coverage into BOTH init and runtime coverage maps.
+                    // setUp typically only CALLs already-deployed contracts, so PCs carry
+                    // *runtime* codehashes (keccak256 of deployed bytecode). But setUp may
+                    // also CREATE new contracts, producing PCs with *init* codehashes.
+                    // Each report-generation pass uses its own codehash-keyed lookup
+                    // (runtime_source_info vs init_source_info), so writing to both maps
+                    // does not double-count: a given codehash matches only one of them.
+                    if !pcs.is_empty() {
+                        let mut init_cov = env.coverage_ref_init.write();
+                        let mut runtime_cov = env.coverage_ref_runtime.write();
+                        for (codehash, pc) in &pcs {
+                            for cov in [&mut *init_cov, &mut *runtime_cov] {
+                                let contract_cov = cov.entry(*codehash).or_default();
+                                let entry = contract_cov.entry(*pc).or_insert((0, 0));
+                                entry.0 |= 1; // Mark as covered at depth 0
+                                entry.1 |= 1; // Mark as successful execution
+                            }
+                        }
+                        info!(
+                            "setUp coverage: {} PCs tracked (recorded in init + runtime maps)",
+                            pcs.len()
+                        );
+                    }
+
+                    // Extract vm.label() calls from setUp
+                    let extracted_labels = evm::tracing::extract_labels_from_traces(&traces);
+                    for (addr, label) in extracted_labels {
+                        vm.labels.insert(addr, label.clone());
+                        // Also add to deployed_addresses if not already there
+                        if !deployed_addresses.iter().any(|(a, _)| *a == addr) {
+                            deployed_addresses.push((addr, label));
                         }
                     }
-                    info!("setUp coverage: {} PCs tracked (recorded in init + runtime maps)", pcs.len());
-                }
 
-                // Extract vm.label() calls from setUp
-                let extracted_labels = evm::tracing::extract_labels_from_traces(&traces);
-                for (addr, label) in extracted_labels {
-                    vm.labels.insert(addr, label.clone());
-                    // Also add to deployed_addresses if not already there
-                    if !deployed_addresses.iter().any(|(a, _)| *a == addr) {
-                        deployed_addresses.push((addr, label));
+                    // Extract contracts created during setUp
+                    let created_addrs = evm::tracing::extract_created_contracts(&traces);
+                    for (idx, addr) in created_addrs.iter().enumerate() {
+                        // Try to identify contract by matching codehash
+                        let label = if let Some(account) = vm.db.get_cached_account(addr) {
+                            let codehash = alloy_primitives::keccak256(
+                                &account
+                                    .info
+                                    .code
+                                    .clone()
+                                    .unwrap_or_default()
+                                    .original_bytes(),
+                            );
+                            env.contracts
+                                .iter()
+                                .find(|c| {
+                                    alloy_primitives::keccak256(&c.deployed_bytecode) == codehash
+                                })
+                                .map(|c| c.name.clone())
+                                .unwrap_or_else(|| format!("Contract_{}", idx))
+                        } else {
+                            format!("Contract_{}", idx)
+                        };
+
+                        info!("  setUp deployed: {} at {:?}", label, addr);
+                        deployed_addresses.push((*addr, label));
                     }
-                }
 
-                // Extract contracts created during setUp
-                let created_addrs = evm::tracing::extract_created_contracts(&traces);
-                for (idx, addr) in created_addrs.iter().enumerate() {
-                    // Try to identify contract by matching codehash
-                    let label = if let Some(account) = vm.db.get_cached_account(addr) {
-                        let codehash = alloy_primitives::keccak256(
-                            &account
-                                .info
-                                .code
-                                .clone()
-                                .unwrap_or_default()
-                                .original_bytes(),
-                        );
-                        env.contracts
-                            .iter()
-                            .find(|c| alloy_primitives::keccak256(&c.deployed_bytecode) == codehash)
-                            .map(|c| c.name.clone())
-                            .unwrap_or_else(|| format!("Contract_{}", idx))
-                    } else {
-                        format!("Contract_{}", idx)
-                    };
-
-                    info!("  setUp deployed: {} at {:?}", label, addr);
-                    deployed_addresses.push((*addr, label));
-                }
-
-                // Extract dictionary values from setUp traces at ALL depths
-                // This captures struct values passed to external calls and event parameters
-                // Merge with constructor-extracted values (don't overwrite)
-                let extracted = campaign::execution::extract_values_from_traces(
-                    &traces,
-                    &env.event_map,
-                    &env.function_map,
-                );
-                info!(
+                    // Extract dictionary values from setUp traces at ALL depths
+                    // This captures struct values passed to external calls and event parameters
+                    // Merge with constructor-extracted values (don't overwrite)
+                    let extracted = campaign::execution::extract_values_from_traces(
+                        &traces,
+                        &env.event_map,
+                        &env.function_map,
+                    );
+                    info!(
                     "setUp dictionary extraction: {} uint values, {} addresses, {} signed values, {} tuples",
                     extracted.uint_values.len(),
                     extracted.addresses.len(),
                     extracted.int_values.len(),
                     extracted.tuples.len()
                 );
-                env.setup_dict_values.extend(extracted.uint_values);
-                env.setup_dict_addresses.extend(extracted.addresses);
-                env.setup_dict_signed.extend(extracted.int_values);
-                env.setup_dict_tuples.extend(extracted.tuples);
-            }
-            Err(e) => {
-                warn!(
-                    "setUp with tracing failed, falling back to normal exec: {}",
-                    e
-                );
-                vm.exec_tx(&setup_tx)?;
+                    env.setup_dict_values.extend(extracted.uint_values);
+                    env.setup_dict_addresses.extend(extracted.addresses);
+                    env.setup_dict_signed.extend(extracted.int_values);
+                    env.setup_dict_tuples.extend(extracted.tuples);
+                }
+                Err(e) => {
+                    warn!(
+                        "setUp with tracing failed, falling back to normal exec: {}",
+                        e
+                    );
+                    vm.exec_tx(&setup_tx)?;
+                }
             }
         }
-    }
 
-    // Build TraceDecoder for address -> contract name resolution (same as campaign)
-    // This uses multiple hash methods: CBOR, selector hash, partial codehash
-    let mut trace_decoder = evm::tracing::TraceDecoder::new();
-    for contract in &env.contracts {
-        trace_decoder.add_contract_by_codehash(contract);
-    }
-
-    // Add dictionary addresses to deployed_addresses for LLM context
-    // These come from constructor/setUp traces and include deployed contracts, actors, etc.
-    for addr in &env.setup_dict_addresses {
-        if !deployed_addresses.iter().any(|(a, _)| a == addr) {
-            // Try to identify contract by:
-            // 1. VM label (set by vm.label() in tests)
-            // 2. Bytecode hash lookup via TraceDecoder (same as campaign)
-            // 3. Fall back to hex address
-            let label = vm.labels.get(addr).cloned().unwrap_or_else(|| {
-                // Use TraceDecoder's resolution logic with the VM's database
-                // This uses CBOR hash, selector hash, and partial codehash (same as campaign)
-                trace_decoder.resolve_address_with_state(addr, &mut vm.db)
-            });
-            deployed_addresses.push((*addr, label));
+        // Build TraceDecoder for address -> contract name resolution (same as campaign)
+        // This uses multiple hash methods: CBOR, selector hash, partial codehash
+        let mut trace_decoder = evm::tracing::TraceDecoder::new();
+        for contract in &env.contracts {
+            trace_decoder.add_contract_by_codehash(contract);
         }
-    }
 
-    info!(
-        "Known addresses for LLM: {} total",
-        deployed_addresses.len()
-    );
-    for (addr, label) in &deployed_addresses {
-        tracing::debug!("  {} = {:?}", label, addr);
-    }
+        // Add dictionary addresses to deployed_addresses for LLM context
+        // These come from constructor/setUp traces and include deployed contracts, actors, etc.
+        for addr in &env.setup_dict_addresses {
+            if !deployed_addresses.iter().any(|(a, _)| a == addr) {
+                // Try to identify contract by:
+                // 1. VM label (set by vm.label() in tests)
+                // 2. Bytecode hash lookup via TraceDecoder (same as campaign)
+                // 3. Fall back to hex address
+                let label = vm.labels.get(addr).cloned().unwrap_or_else(|| {
+                    // Use TraceDecoder's resolution logic with the VM's database
+                    // This uses CBOR hash, selector hash, and partial codehash (same as campaign)
+                    trace_decoder.resolve_address_with_state(addr, &mut vm.db)
+                });
+                deployed_addresses.push((*addr, label));
+            }
+        }
 
-    // Now create tests with the ACTUAL deployed address
-    let tests = campaign::testing::create_tests(
-        &env.cfg.sol_conf.test_mode,
-        deployed_addr, // Use actual deployed address
-        &echidna_funcs,
-        &fuzzable_sigs,
-    );
-
-    info!(
-        "Created {} tests for mode '{}'",
-        tests.len(),
-        env.cfg.sol_conf.test_mode
-    );
-    for test in tests {
-        info!("  - {}", test.test_type.name());
-        env.add_test(test);
-    }
-
-    // Handle replay mode: just replay the sequence and show traces, then exit
-    if let Some(replay_file) = &args.replay {
-        return replay_sequence(
-            replay_file,
-            &mut vm,
-            &main_contract.name,
-            &env.contracts,
-            &deployed_addresses,
+        info!(
+            "Known addresses for LLM: {} total",
+            deployed_addresses.len()
         );
-    }
+        for (addr, label) in &deployed_addresses {
+            tracing::debug!("  {} = {:?}", label, addr);
+        }
 
-    // Handle convert-only mode: export recon corpus to Echidna format and exit
-    if args.convert {
-        let export_dir = env.cfg.campaign_conf.export_dir.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--convert requires --recon-corpus-dir to specify the recon corpus location"
-            )
-        })?;
-        let corpus_dir = env
-            .cfg
-            .campaign_conf
-            .corpus_dir
-            .as_ref()
-            .map(|p| p.as_path())
-            .unwrap_or(std::path::Path::new("echidna"));
-        let count = campaign::export::export_corpus_to_echidna(corpus_dir, export_dir)?;
-        println!(
-            "Exported {} corpus files to {}",
-            count,
-            export_dir.display()
+        // Now create tests with the ACTUAL deployed address
+        let tests = campaign::testing::create_tests(
+            &env.cfg.sol_conf.test_mode,
+            deployed_addr, // Use actual deployed address
+            &echidna_funcs,
+            &fuzzable_sigs,
         );
-        return Ok(());
-    }
 
-    // Handle shrink-only mode: load reproducers, match to tests, shrink
-    if args.shrink {
-        return run_shrink_mode(&mut env, &mut vm, &main_contract, &deployed_addresses);
-    }
+        info!(
+            "Created {} tests for mode '{}'",
+            tests.len(),
+            env.cfg.sol_conf.test_mode
+        );
+        for test in tests {
+            info!("  - {}", test.test_type.name());
+            env.add_test(test);
+        }
 
-    // Set up stop flags for graceful shutdown
-    // stop_flag: First Ctrl+C, triggers graceful stop + shrinking
-    // force_stop: Second Ctrl+C, immediate stop (skip/abort shrinking)
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let force_stop = Arc::new(AtomicBool::new(false));
-    let stop_flag_clone = stop_flag.clone();
-    let force_stop_clone = force_stop.clone();
-
-    ctrlc::set_handler(move || {
-        if stop_flag_clone.load(Ordering::Relaxed) {
-            // Second Ctrl+C - force immediate stop
-            eprintln!("\nReceived second Ctrl+C, stopping immediately...");
-            force_stop_clone.store(true, Ordering::Relaxed);
-        } else {
-            // First Ctrl+C - graceful stop with shrinking
-            eprintln!(
-                "\nReceived Ctrl+C, shrinking tests... (press Ctrl+C again to stop immediately)"
+        // Handle replay mode: just replay the sequence and show traces, then exit
+        if let Some(replay_file) = &args.replay {
+            return replay_sequence(
+                replay_file,
+                &mut vm,
+                &main_contract.name,
+                &env.contracts,
+                &deployed_addresses,
             );
-            stop_flag_clone.store(true, Ordering::Relaxed);
         }
-    })?;
 
-    // Run campaign
-    info!("Starting fuzzing campaign...");
-
-    // Load corpus from disk
-    let initial_corpus = load_corpus(&env).unwrap_or_else(|e| {
-        tracing::warn!("Failed to load corpus: {}", e);
-        Vec::new()
-    });
-
-    // Save initial VM state for trace generation at the end
-    let initial_vm = vm.clone();
-
-    // Spawn web UI server if --web is set
-    let web_mode = args.web.is_some();
-    if web_mode {
-        // Resolve the frontend URL:
-        // --web <url>  →  use that URL directly
-        // --web        →  FUZZER_WEB_URL env var, or production default
-        let web_url_arg = args.web.as_deref().unwrap_or("");
-        let frontend_url = if !web_url_arg.is_empty() {
-            web_url_arg.to_string()
-        } else {
-            std::env::var("FUZZER_WEB_URL")
-                .unwrap_or_else(|_| DEFAULT_WEB_UI_URL.to_string())
-        };
-
-        let ((), web_state) = spawn_web_server(
-            &env,
-            deployed_addresses.clone(),
-            args.web_port,
-            Some(stop_flag.clone()),
-            &frontend_url,
-            !args.no_open,
-        )?;
-        // Store web_state in env so workers can record statistics
-        env.web_state = Some(web_state.clone());
-
-        // Set initial VM state for replay functionality
-        web_state.set_initial_vm(initial_vm.clone());
-    }
-
-    let stop_flag_check = stop_flag.clone();
-
-    // Set campaign state to Running just before starting (starts the timer)
-    if let Some(ref web_state) = env.web_state {
-        web_state.set_campaign_state(recon_web::CampaignState::Running);
-    }
-
-    // Run the campaign
-    run_campaign(
-        &mut env,
-        vm.clone(),
-        initial_corpus,
-        stop_flag.clone(),
-        force_stop.clone(),
-    )?;
-
-    // Update campaign state if in web mode
-    if let Some(ref web_state) = env.web_state {
-        if stop_flag_check.load(Ordering::Relaxed) {
-            web_state.set_campaign_state(recon_web::CampaignState::Finished);
-        } else {
-            web_state.set_campaign_state(recon_web::CampaignState::Finished);
-        }
-    }
-
-    // Export corpus to Echidna format if requested
-    if let Some(ref export_dir) = env.cfg.campaign_conf.export_dir {
-        let corpus_dir = env
-            .cfg
-            .campaign_conf
-            .corpus_dir
-            .as_ref()
-            .map(|p| p.as_path())
-            .unwrap_or(std::path::Path::new("echidna"));
-        match campaign::export::export_corpus_to_echidna(corpus_dir, export_dir) {
-            Ok(count) => println!(
+        // Handle convert-only mode: export recon corpus to Echidna format and exit
+        if args.convert {
+            let export_dir = env.cfg.campaign_conf.export_dir.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--convert requires --recon-corpus-dir to specify the recon corpus location"
+                )
+            })?;
+            let corpus_dir = env
+                .cfg
+                .campaign_conf
+                .corpus_dir
+                .as_ref()
+                .map(|p| p.as_path())
+                .unwrap_or(std::path::Path::new("echidna"));
+            let count = campaign::export::export_corpus_to_echidna(corpus_dir, export_dir)?;
+            println!(
                 "Exported {} corpus files to {}",
                 count,
                 export_dir.display()
-            ),
-            Err(e) => warn!("Failed to export corpus: {}", e),
+            );
+            return Ok(());
         }
-    }
 
-    if stop_flag_check.load(Ordering::Relaxed) {
-        println!("Killed (thread killed). Stopping");
-    } else {
-        println!("Test limit reached. Stopping.");
-    }
+        // Handle shrink-only mode: load reproducers, match to tests, shrink
+        if args.shrink {
+            return run_shrink_mode(&mut env, &mut vm, &main_contract, &deployed_addresses);
+        }
 
-    // Report results (Echidna-compatible format)
-    println!();
-    let tests = env.get_tests();
-    let mut any_failed = false;
+        // Load corpus from disk
+        let initial_corpus = load_corpus(&env).unwrap_or_else(|e| {
+            tracing::warn!("Failed to load corpus: {}", e);
+            Vec::new()
+        });
 
-    let contract_name = main_contract.name.as_str();
+        // Save initial VM state for trace generation at the end
+        let initial_vm = vm.clone();
 
-    for test in &tests {
-        let test_name = test.test_type.name();
-        let is_optimization = matches!(
-            test.test_type,
-            campaign::testing::TestType::OptimizationTest { .. }
-        );
+        // Spawn web UI server if --web is set
+        // On reload: re-spawn with fresh state (new env, contracts, tests, coverage)
+        if web_mode {
+            let web_url_arg = args.web.as_deref().unwrap_or("");
+            let frontend_url = if !web_url_arg.is_empty() {
+                web_url_arg.to_string()
+            } else {
+                std::env::var("FUZZER_WEB_URL").unwrap_or_else(|_| DEFAULT_WEB_UI_URL.to_string())
+            };
 
-        match &test.state {
-            campaign::testing::TestState::Passed | campaign::testing::TestState::Open => {
-                if is_optimization {
-                    // For optimization tests, show max value like Echidna
-                    if let campaign::testing::TestValue::IntValue(v) = &test.value {
-                        println!("{}(): max value: {}", test_name, v);
-                        if !test.reproducer.is_empty() {
-                            print_call_sequence(&test.reproducer, contract_name);
+            // Shut down old server before re-binding the same port
+            if let Some(tx) = web_shutdown.take() {
+                let _ = tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                info!("Old web server shut down, re-spawning with fresh state...");
+            }
+
+            let open_browser = !args.no_open && !is_reload;
+            let (shutdown_tx, web_state) = spawn_web_server(
+                &env,
+                deployed_addresses.clone(),
+                args.web_port,
+                Some(stop_flag.clone()),
+                &frontend_url,
+                open_browser,
+            )?;
+            web_shutdown = Some(shutdown_tx);
+            env.web_state = Some(web_state.clone());
+            web_state.set_initial_vm(initial_vm.clone());
+        }
+
+        // Set campaign state to Running just before starting
+        if let Some(ref web_state) = env.web_state {
+            web_state.set_campaign_state(recon_web::CampaignState::Running);
+        }
+
+        // Run the campaign
+        run_campaign(
+            &mut env,
+            vm.clone(),
+            initial_corpus,
+            stop_flag.clone(),
+            force_stop.clone(),
+            reload_flag.clone(),
+        )?;
+
+        // Check if this was a hot reload stop
+        if reload_flag.load(Ordering::Relaxed) {
+            stop_flag.store(false, Ordering::SeqCst);
+            reload_flag.store(false, Ordering::SeqCst);
+            is_reload = true;
+            continue 'hot_reload;
+        }
+
+        // Normal exit — update campaign state and fall through to reporting
+        if let Some(ref web_state) = env.web_state {
+            web_state.set_campaign_state(recon_web::CampaignState::Finished);
+        }
+
+        // === Final reporting (only on normal exit, not hot reload) ===
+
+        // Export corpus to Echidna format if requested
+        if let Some(ref export_dir) = env.cfg.campaign_conf.export_dir {
+            let corpus_dir = env
+                .cfg
+                .campaign_conf
+                .corpus_dir
+                .as_ref()
+                .map(|p| p.as_path())
+                .unwrap_or(std::path::Path::new("echidna"));
+            match campaign::export::export_corpus_to_echidna(corpus_dir, export_dir) {
+                Ok(count) => println!(
+                    "Exported {} corpus files to {}",
+                    count,
+                    export_dir.display()
+                ),
+                Err(e) => warn!("Failed to export corpus: {}", e),
+            }
+        }
+
+        if stop_flag.load(Ordering::Relaxed) {
+            println!("Killed (thread killed). Stopping");
+        } else {
+            println!("Test limit reached. Stopping.");
+        }
+
+        // Report results (Echidna-compatible format)
+        println!();
+        let tests = env.get_tests();
+        let mut any_failed = false;
+
+        let contract_name = main_contract.name.as_str();
+
+        for test in &tests {
+            let test_name = test.test_type.name();
+            let is_optimization = matches!(
+                test.test_type,
+                campaign::testing::TestType::OptimizationTest { .. }
+            );
+
+            match &test.state {
+                campaign::testing::TestState::Passed | campaign::testing::TestState::Open => {
+                    if is_optimization {
+                        // For optimization tests, show max value like Echidna
+                        if let campaign::testing::TestValue::IntValue(v) = &test.value {
+                            println!("{}(): max value: {}", test_name, v);
+                            if !test.reproducer.is_empty() {
+                                print_call_sequence(&test.reproducer, contract_name);
+                            }
+                        } else {
+                            println!("{}(): passing", test_name);
                         }
                     } else {
                         println!("{}(): passing", test_name);
                     }
-                } else {
-                    println!("{}(): passing", test_name);
                 }
-            }
-            campaign::testing::TestState::Solved => {
-                if is_optimization {
-                    if let campaign::testing::TestValue::IntValue(v) = &test.value {
-                        println!("{}(): max value: {}", test_name, v);
+                campaign::testing::TestState::Solved => {
+                    if is_optimization {
+                        if let campaign::testing::TestValue::IntValue(v) = &test.value {
+                            println!("{}(): max value: {}", test_name, v);
+                        } else {
+                            any_failed = true;
+                            println!("{}(): failed!💥", test_name);
+                        }
                     } else {
                         any_failed = true;
                         println!("{}(): failed!💥", test_name);
                     }
-                } else {
-                    any_failed = true;
-                    println!("{}(): failed!💥", test_name);
-                }
-                print_call_sequence_with_decode(
-                    &test.reproducer,
-                    contract_name,
-                    test,
-                    Some(&main_contract),
-                );
-
-                // Print detailed traces for the falsified sequence
-                if !is_optimization && !test.reproducer.is_empty() {
-                    campaign::output::print_traces(
-                        &mut initial_vm.clone(),
+                    print_call_sequence_with_decode(
                         &test.reproducer,
                         contract_name,
-                        &env.contracts,
-                        &deployed_addresses,
+                        test,
                         Some(&main_contract),
-                        test.gen_dict_snapshot.as_ref(),
                     );
-                }
-            }
 
-            campaign::testing::TestState::Large(n) => {
-                let shrink_limit = env.cfg.campaign_conf.shrink_limit;
-                if is_optimization {
-                    if let campaign::testing::TestValue::IntValue(v) = &test.value {
-                        println!(
-                            "{}(): max value: {} (shrinking {}/{})",
-                            test_name, v, n, shrink_limit
+                    // Print detailed traces for the falsified sequence
+                    if !is_optimization && !test.reproducer.is_empty() {
+                        campaign::output::print_traces(
+                            &mut initial_vm.clone(),
+                            &test.reproducer,
+                            contract_name,
+                            &env.contracts,
+                            &deployed_addresses,
+                            Some(&main_contract),
+                            test.gen_dict_snapshot.as_ref(),
                         );
+                    }
+                }
+
+                campaign::testing::TestState::Large(n) => {
+                    let shrink_limit = env.cfg.campaign_conf.shrink_limit;
+                    if is_optimization {
+                        if let campaign::testing::TestValue::IntValue(v) = &test.value {
+                            println!(
+                                "{}(): max value: {} (shrinking {}/{})",
+                                test_name, v, n, shrink_limit
+                            );
+                        } else {
+                            any_failed = true;
+                            println!("{}(): failed!💥", test_name);
+                            println!("  Call sequence, shrinking {}/{}:", n, shrink_limit);
+                        }
                     } else {
                         any_failed = true;
                         println!("{}(): failed!💥", test_name);
                         println!("  Call sequence, shrinking {}/{}:", n, shrink_limit);
                     }
-                } else {
-                    any_failed = true;
-                    println!("{}(): failed!💥", test_name);
-                    println!("  Call sequence, shrinking {}/{}:", n, shrink_limit);
-                }
-                print_call_sequence_with_decode(
-                    &test.reproducer,
-                    contract_name,
-                    test,
-                    Some(&main_contract),
-                );
-
-                // Print detailed traces for the falsified sequence (even while shrinking)
-                if !is_optimization && !test.reproducer.is_empty() {
-                    campaign::output::print_traces(
-                        &mut initial_vm.clone(),
+                    print_call_sequence_with_decode(
                         &test.reproducer,
                         contract_name,
-                        &env.contracts,
-                        &deployed_addresses,
+                        test,
                         Some(&main_contract),
-                        test.gen_dict_snapshot.as_ref(),
                     );
+
+                    // Print detailed traces for the falsified sequence (even while shrinking)
+                    if !is_optimization && !test.reproducer.is_empty() {
+                        campaign::output::print_traces(
+                            &mut initial_vm.clone(),
+                            &test.reproducer,
+                            contract_name,
+                            &env.contracts,
+                            &deployed_addresses,
+                            Some(&main_contract),
+                            test.gen_dict_snapshot.as_ref(),
+                        );
+                    }
+                }
+                campaign::testing::TestState::Failed(e) => {
+                    println!("{}(): could not evaluate ☣", test_name);
+                    println!("  {}", e);
                 }
             }
-            campaign::testing::TestState::Failed(e) => {
-                println!("{}(): could not evaluate ☣", test_name);
-                println!("  {}", e);
+        }
+
+        // Print coverage stats
+        {
+            let init_cov = env.coverage_ref_init.read();
+            let runtime_cov = env.coverage_ref_runtime.read();
+            let (points, codehashes) = evm::coverage::coverage_stats(&init_cov, &runtime_cov);
+            println!();
+            println!("Unique instructions: {}", points);
+
+            println!("Unique codehashes: {}", codehashes);
+
+            // Generate coverage reports (LCOV + HTML) - default to "echidna" directory
+            let corpus_dir = env
+                .cfg
+                .campaign_conf
+                .corpus_dir
+                .as_ref()
+                .map(|p| p.as_path())
+                .unwrap_or(std::path::Path::new("echidna"));
+            match generate_coverage_reports(
+                &args.project,
+                &init_cov,
+                &runtime_cov,
+                &env.contracts,
+                corpus_dir,
+                env.build_info_snapshot_dir.as_deref(),
+            ) {
+                Ok((lcov_path, html_path)) => {
+                    info!("Saved LCOV coverage report to {:?}", lcov_path);
+                    println!("Coverage report: {}", html_path.display());
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to generate coverage reports: {}", e);
+                }
             }
         }
-    }
 
-    // Print coverage stats
-    {
-        let init_cov = env.coverage_ref_init.read();
-        let runtime_cov = env.coverage_ref_runtime.read();
-        let (points, codehashes) = evm::coverage::coverage_stats(&init_cov, &runtime_cov);
-        println!();
-        println!("Unique instructions: {}", points);
+        // Save fork cache if in fork mode (persists RPC data for future runs).
+        // Always save to the chain-scoped default location, and additionally to
+        // the corpus dir when one is configured (echidna-compatible layout, so
+        // the cache file can be checked into the project).
+        if initial_vm.is_fork() {
+            match initial_vm.save_fork_cache() {
+                Ok(()) => info!("Saved fork cache to disk for future runs"),
+                Err(e) => tracing::warn!("Failed to save fork cache: {}", e),
+            }
+            if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
+                match initial_vm.save_fork_cache_to_dir(corpus_dir) {
+                    Ok(()) => info!("Saved RPC cache to corpus dir {:?}", corpus_dir),
+                    Err(e) => tracing::warn!(
+                        "Failed to save RPC cache to corpus dir {:?}: {}",
+                        corpus_dir,
+                        e
+                    ),
+                }
+            }
 
-        println!("Unique codehashes: {}", codehashes);
+            // Per-address on-chain coverage (mirrors echidna's
+            // `Onchain.saveCoverageReport`): for every contract whose code the
+            // fork pulled from RPC, fetch verified source from Sourcify (then
+            // Etherscan if `ETHERSCAN_API_KEY` is set) and write
+            // `<corpus>/<addr>/covered.<unix_ts>.{html,lcov}`.
+            if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
+                let chain_id = initial_vm.chain_id();
+                let contracts = initial_vm.fork_contracts_with_code();
+                // Filter out the deployed test contract — its source is local.
+                let test_addr = env.cfg.sol_conf.contract_addr;
+                let contracts: Vec<_> = contracts
+                    .into_iter()
+                    .filter(|(addr, _)| *addr != test_addr)
+                    .collect();
+                if !contracts.is_empty() {
+                    info!(
+                        "Generating on-chain coverage reports for {} addresses…",
+                        contracts.len()
+                    );
+                    let runtime_cov = env.coverage_ref_runtime.read().clone();
+                    let reports = evm::coverage::onchain::save_onchain_coverage_reports(
+                        chain_id,
+                        &contracts,
+                        &runtime_cov,
+                        corpus_dir,
+                    );
+                    for r in &reports {
+                        println!(
+                            "On-chain coverage [{} {}]: {}",
+                            r.address.to_checksum(None),
+                            r.contract_name,
+                            r.html_path.display()
+                        );
+                    }
+                }
+            }
+        }
 
-        // Generate coverage reports (LCOV + HTML) - default to "echidna" directory
-        let corpus_dir = env
+        // Print corpus size
+        {
+            let corpus = env.corpus_ref.read();
+            println!("Corpus size: {}", corpus.len());
+        }
+
+        // Print seed (will always be Some after campaign runs, since we generate one if not provided)
+        let seed = env
             .cfg
             .campaign_conf
-            .corpus_dir
-            .as_ref()
-            .map(|p| p.as_path())
-            .unwrap_or(std::path::Path::new("echidna"));
-        match generate_coverage_reports(
-            &args.project,
-            &init_cov,
-            &runtime_cov,
-            &env.contracts,
-            corpus_dir,
-            env.build_info_snapshot_dir.as_deref(),
-        ) {
-            Ok((lcov_path, html_path)) => {
-                info!("Saved LCOV coverage report to {:?}", lcov_path);
-                println!("Coverage report: {}", html_path.display());
-            }
-            Err(e) => {
-                tracing::warn!("Failed to generate coverage reports: {}", e);
-            }
-        }
-    }
+            .seed
+            .expect("Seed should be set after campaign");
+        println!("Seed: {}", seed);
 
-    // Save fork cache if in fork mode (persists RPC data for future runs).
-    // Always save to the chain-scoped default location, and additionally to
-    // the corpus dir when one is configured (echidna-compatible layout, so
-    // the cache file can be checked into the project).
-    if initial_vm.is_fork() {
-        match initial_vm.save_fork_cache() {
-            Ok(()) => info!("Saved fork cache to disk for future runs"),
-            Err(e) => tracing::warn!("Failed to save fork cache: {}", e),
-        }
-        if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
-            match initial_vm.save_fork_cache_to_dir(corpus_dir) {
-                Ok(()) => info!("Saved RPC cache to corpus dir {:?}", corpus_dir),
-                Err(e) => tracing::warn!(
-                    "Failed to save RPC cache to corpus dir {:?}: {}",
-                    corpus_dir,
-                    e
-                ),
-            }
-        }
+        println!();
 
-        // Per-address on-chain coverage (mirrors echidna's
-        // `Onchain.saveCoverageReport`): for every contract whose code the
-        // fork pulled from RPC, fetch verified source from Sourcify (then
-        // Etherscan if `ETHERSCAN_API_KEY` is set) and write
-        // `<corpus>/<addr>/covered.<unix_ts>.{html,lcov}`.
-        if let Some(corpus_dir) = env.cfg.campaign_conf.corpus_dir.as_ref() {
-            let chain_id = initial_vm.chain_id();
-            let contracts = initial_vm.fork_contracts_with_code();
-            // Filter out the deployed test contract — its source is local.
-            let test_addr = env.cfg.sol_conf.contract_addr;
-            let contracts: Vec<_> = contracts
-                .into_iter()
-                .filter(|(addr, _)| *addr != test_addr)
-                .collect();
-            if !contracts.is_empty() {
-                info!(
-                    "Generating on-chain coverage reports for {} addresses…",
-                    contracts.len()
-                );
-                let runtime_cov = env.coverage_ref_runtime.read().clone();
-                let reports = evm::coverage::onchain::save_onchain_coverage_reports(
-                    chain_id,
-                    &contracts,
-                    &runtime_cov,
-                    corpus_dir,
-                );
-                for r in &reports {
-                    println!(
-                        "On-chain coverage [{} {}]: {}",
-                        r.address.to_checksum(None),
-                        r.contract_name,
-                        r.html_path.display()
-                    );
-                }
-            }
-        }
-    }
-
-    // Print corpus size
-    {
-        let corpus = env.corpus_ref.read();
-        println!("Corpus size: {}", corpus.len());
-    }
-
-    // Print seed (will always be Some after campaign runs, since we generate one if not provided)
-    let seed = env
-        .cfg
-        .campaign_conf
-        .seed
-        .expect("Seed should be set after campaign");
-    println!("Seed: {}", seed);
-
-    println!();
-
-    // If in web mode, keep running so user can investigate results
-    if web_mode {
-        info!(
+        // If in web mode, keep running so user can investigate results
+        if web_mode {
+            info!(
             "Campaign finished. Web UI is still running for investigation. Press Ctrl+C to exit."
         );
 
-        // Keep the web server alive until user exits
-        loop {
-            // Check if user wants to exit
-            if force_stop.load(Ordering::Relaxed) {
-                info!("Received exit signal, shutting down...");
-                break;
+            // Keep the web server alive until user exits
+            loop {
+                // Check if user wants to exit
+                if force_stop.load(Ordering::Relaxed) {
+                    info!("Received exit signal, shutting down...");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-    }
 
-    // Exit with appropriate code
-    if any_failed {
-        std::process::exit(1);
-    }
+        // Exit with appropriate code
+        if any_failed {
+            std::process::exit(1);
+        }
+
+        break 'hot_reload;
+    } // end 'hot_reload loop
 
     Ok(())
 }
@@ -1695,7 +1758,15 @@ fn replay_sequence(
     // Note: reentrancy call context is not available in standalone replay mode
     // Use fuzzing mode to see reentrancy calls in traces
     println!("Execution traces:");
-    campaign::output::print_traces(vm, &txs, contract_name, contracts, deployed_addresses, None, None);
+    campaign::output::print_traces(
+        vm,
+        &txs,
+        contract_name,
+        contracts,
+        deployed_addresses,
+        None,
+        None,
+    );
 
     Ok(())
 }
@@ -2031,8 +2102,8 @@ fn generate_coverage_reports(
 ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
     use evm::coverage::{
         build_codehash_to_source_info, build_init_codehash_to_source_info,
-        generate_source_coverage_multi, load_source_info, load_source_info_from,
-        save_html_report, save_lcov_report,
+        generate_source_coverage_multi, load_source_info, load_source_info_from, save_html_report,
+        save_lcov_report,
     };
 
     // Load source file information (per-build-info file-id remap is built here).

@@ -300,6 +300,9 @@ async fn state_sampler<S: Observable>(
     // This avoids blocking the async runtime at startup
     let mut last_coverage: Option<CoverageSnapshot> = None;
     let mut interval_timer = tokio::time::interval(interval);
+    let mut ticks_since_coverage_send: u64 = 0;
+    // Resend full coverage every N ticks so late-joining clients catch up
+    let coverage_refresh_ticks = std::cmp::max(1, 10_000 / interval.as_millis() as u64);
 
     loop {
         interval_timer.tick().await;
@@ -309,10 +312,13 @@ async fn state_sampler<S: Observable>(
             continue;
         }
 
+        ticks_since_coverage_send += 1;
+
         // Run all lock-acquiring operations in a blocking task
         // This prevents blocking the single-threaded async runtime
         let state_clone = Arc::clone(&state);
         let last_cov = last_coverage.take();
+        let force_coverage_refresh = ticks_since_coverage_send >= coverage_refresh_ticks;
 
         let result = tokio::task::spawn_blocking(move || {
             // Get current stats (fast - just atomic reads)
@@ -331,8 +337,8 @@ async fn state_sampler<S: Observable>(
                 },
             };
 
-            // Only compute line coverage when there's new coverage
-            let source_line_coverage = if delta.new_instructions > 0 {
+            // Send line coverage when there's new coverage or periodically
+            let source_line_coverage = if delta.new_instructions > 0 || force_coverage_refresh {
                 Some(state_clone.get_source_line_coverage())
             } else {
                 None
@@ -357,9 +363,10 @@ async fn state_sampler<S: Observable>(
 
         match result {
             Ok((update, current_coverage)) => {
-                // Store for next iteration
+                if update.source_line_coverage.is_some() {
+                    ticks_since_coverage_send = 0;
+                }
                 last_coverage = Some(current_coverage);
-                // Send to all connected clients
                 let _ = tx.send(ServerMessage::StateUpdate(update));
             }
             Err(e) => {

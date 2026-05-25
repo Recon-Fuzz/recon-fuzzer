@@ -722,7 +722,6 @@ impl Observable for WebObservableState {
                 }
             }
 
-            // Build coverage snapshot (fast - just keys and counts)
             let runtime: Vec<ContractCoverage> = runtime_cov
                 .iter()
                 .map(|(codehash, pc_map)| ContractCoverage {
@@ -754,12 +753,12 @@ impl Observable for WebObservableState {
         // For init payload, skip expensive source line coverage computation
         // The UI will receive it via periodic updates (StateUpdate messages)
 
-        // Get files that are in src/ folder (fast - no coverage computation needed)
-        let files_with_hits: HashSet<String> = self.source_files
+        let mut files_with_hits: HashSet<String> = self.source_files
             .iter()
             .filter(|f| f.path.starts_with("src/") || f.path.starts_with("src\\"))
             .map(|f| f.path.clone())
             .collect();
+        files_with_hits.extend(self.get_files_with_coverage_hits());
 
         // Use cached data for filtering
         let contracts = self.get_contract_summaries_cached(&codehashes_with_coverage);
@@ -795,10 +794,7 @@ impl Observable for WebObservableState {
             test_folder: self.test_folder.clone(),
         };
 
-        // Skip expensive source_line_coverage and pc_mappings in init payload
-        // The UI will receive source_line_coverage via periodic StateUpdate messages
-        // PC mappings can be requested on-demand if needed
-        let source_line_coverage: Vec<SourceLineCoverage> = vec![];
+        let source_line_coverage = vec![];
         let pc_mappings: Vec<ContractPcMapping> = vec![];
 
         InitPayload {

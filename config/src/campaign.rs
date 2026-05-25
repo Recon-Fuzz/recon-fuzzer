@@ -98,6 +98,10 @@ pub struct CampaignConf {
     /// Shrink-only mode: skip fuzzing, load existing reproducers, and shrink them
     #[serde(default)]
     pub shrink_only: bool,
+
+    /// Hot reload: watch .sol files and restart campaign on recompilation
+    #[serde(default, alias = "hotReload")]
+    pub hot_reload: bool,
 }
 
 // Default functions
@@ -137,6 +141,7 @@ impl Default for CampaignConf {
             // Shortcuts hoisting
             shortcuts_enable: false,
             shrink_only: false,
+            hot_reload: false,
         }
     }
 }
