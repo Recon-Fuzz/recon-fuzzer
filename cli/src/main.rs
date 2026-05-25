@@ -183,6 +183,11 @@ struct FuzzArgs {
     #[arg(long, hide = true)]
     #[allow(dead_code)]
     disable_slither: bool,
+
+    /// Disable runtime dictionary extraction (re-tracing coverage-increasing sequences to
+    /// harvest struct/tuple values created mid-campaign). On by default; use this to benchmark.
+    #[arg(long)]
+    no_runtime_dict: bool,
 }
 
 /// Clap value parser for usize that caps oversized values at usize::MAX
@@ -590,6 +595,9 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     }
     if args.fast {
         config.campaign_conf.coverage_mode = "branch".to_string();
+    }
+    if args.no_runtime_dict {
+        config.campaign_conf.runtime_dict_extraction = false;
     }
     if args.shortcuts {
         config.campaign_conf.shortcuts_enable = true;

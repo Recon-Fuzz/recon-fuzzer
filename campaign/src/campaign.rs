@@ -598,6 +598,29 @@ fn run_fuzz_worker(
         })
         .unwrap_or_default();
 
+    // Runtime dictionary extraction: when a sequence finds new coverage, replay it with
+    // tracing and harvest struct/tuple values from nested calls. Build the selector->Function
+    // map once per worker (only needed when the feature is on).
+    let runtime_dict_extraction = env.cfg.campaign_conf.runtime_dict_extraction;
+    let runtime_dict_function_map: std::collections::HashMap<
+        alloy_primitives::FixedBytes<4>,
+        alloy_json_abi::Function,
+    > = if runtime_dict_extraction {
+        let mut m = std::collections::HashMap::new();
+        for contract in env.contracts.iter() {
+            for func in contract.abi.functions() {
+                m.insert(func.selector(), func.clone());
+            }
+        }
+        m
+    } else {
+        std::collections::HashMap::new()
+    };
+    // Functions whose effects we've already retraced for dictionary extraction. Retracing the
+    // first sequence to exercise each function ensures struct values built by already-covered
+    // code (e.g. creating a second market) are still harvested, not just new-coverage paths.
+    let mut retraced_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // Save initial VM state for shrinking (Echidna passes initial vm to shrinkTest)
     // each sequence is executed from initial state, not accumulated state
     let initial_vm = vm.clone();
@@ -812,6 +835,31 @@ fn run_fuzz_worker(
             total_gas.fetch_add(local_gas_pending, Ordering::Relaxed);
             local_calls_pending = 0;
             local_gas_pending = 0;
+        }
+
+        // Re-trace this sequence with full tracing to harvest struct/tuple values from nested
+        // calls (e.g. a market built mid-campaign) that the lightweight hot-loop inspector
+        // cannot see. Triggered when the sequence found new coverage OR it exercises a target
+        // function for the first time — the latter matters because struct values built by
+        // already-covered code (creating a 2nd market reuses createMarket) never raise coverage.
+        if runtime_dict_extraction {
+            let mut interesting = new_cov;
+            for tx in &tx_seq {
+                if let evm::types::TxCall::SolCall { name, .. } = &tx.call {
+                    if retraced_fns.insert(name.clone()) {
+                        interesting = true;
+                    }
+                }
+            }
+            if interesting {
+                crate::execution::retrace_sequence_extract_dict(
+                    &initial_vm,
+                    &tx_seq,
+                    &mut worker.gen_dict,
+                    &env.event_map,
+                    &runtime_dict_function_map,
+                );
+            }
         }
 
         if new_cov {

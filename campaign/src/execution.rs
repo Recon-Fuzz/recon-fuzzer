@@ -74,8 +74,13 @@ pub fn extract_dict_from_traces(
             continue;
         }
 
-        // Extract call inputs (arguments passed to external calls)
-        if trace.data.len() >= 4 {
+        // Extract call inputs (arguments passed to external calls).
+        // Skip depth 0: that's the fuzzer's own top-level tx, whose args the fuzzer already
+        // generated. Re-harvesting them would feed random/invalid structs back into the dict
+        // and dilute genuinely useful values. Inputs to NESTED calls (depth > 0) are
+        // contract-derived (e.g. a `MarketParams` read from storage and passed to createMarket),
+        // which is exactly what we want to learn.
+        if trace.depth > 0 && trace.data.len() >= 4 {
             let selector: [u8; 4] = trace.data[0..4].try_into().unwrap_or([0; 4]);
             let selector_fixed = alloy_primitives::FixedBytes::from(selector);
 
@@ -217,6 +222,38 @@ pub fn extract_dict_from_traces(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Re-run a coverage-increasing sequence from a clean baseline VM with full tracing,
+/// harvesting struct/tuple values (and scalars) passed to nested calls into the dictionary.
+///
+/// The hot fuzzing loop runs only the lightweight `CombinedInspector`, which never builds a
+/// `CallTraceArena`, so nested-call inputs (e.g. a `MarketParams` constructed mid-campaign and
+/// handed to an internal `createMarket`) are invisible to per-tx harvesting. This replays the
+/// sequence against a fresh clone of the post-setUp baseline — deterministic and identical to the
+/// original run — and feeds each tx's trace through `extract_dict_from_traces`.
+///
+/// Cost is bounded: callers only invoke this on "interesting" sequences (new coverage, or the
+/// first sequence to exercise a given target function), not every sequence.
+pub fn retrace_sequence_extract_dict(
+    base_vm: &EvmState,
+    tx_seq: &[Tx],
+    gen_dict: &mut GenDict,
+    event_map: &std::collections::HashMap<alloy_primitives::B256, alloy_json_abi::Event>,
+    function_map: &std::collections::HashMap<
+        alloy_primitives::FixedBytes<4>,
+        alloy_json_abi::Function,
+    >,
+) {
+    // Replay from a throwaway clone so the authoritative campaign state is untouched.
+    let mut vm = base_vm.clone();
+    vm.generate_calls_context = None;
+    for tx in tx_seq {
+        // Best-effort: a tx that errors under tracing is simply skipped.
+        if let Ok((_result, arena, ..)) = vm.exec_tx_with_revm_tracing(tx) {
+            extract_dict_from_traces(&arena, gen_dict, event_map, function_map);
         }
     }
 }

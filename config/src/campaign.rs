@@ -98,6 +98,13 @@ pub struct CampaignConf {
     /// Shrink-only mode: skip fuzzing, load existing reproducers, and shrink them
     #[serde(default)]
     pub shrink_only: bool,
+
+    /// Runtime dictionary extraction: when a sequence finds new coverage, replay it
+    /// with full tracing and harvest struct/tuple values passed to nested calls
+    /// (e.g. a MarketParams built mid-campaign) into the dictionary. Bounded cost:
+    /// only fires on coverage-increasing sequences. Enabled by default.
+    #[serde(default = "default_runtime_dict_extraction")]
+    pub runtime_dict_extraction: bool,
 }
 
 // Default functions
@@ -108,6 +115,7 @@ fn default_adaptive_check() -> bool { true }
 fn default_hot_function_weight() -> usize { 3 }
 fn default_lcov_interval() -> u64 { 30 }
 fn default_coverage_mode() -> String { "full".to_string() }
+fn default_runtime_dict_extraction() -> bool { true }
 
 impl Default for CampaignConf {
     fn default() -> Self {
@@ -137,6 +145,7 @@ impl Default for CampaignConf {
             // Shortcuts hoisting
             shortcuts_enable: false,
             shrink_only: false,
+            runtime_dict_extraction: default_runtime_dict_extraction(),
         }
     }
 }
