@@ -2,6 +2,7 @@
 //!
 //! Contains cloned Arc refs for thread-safe access to shared state.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, I256, U256};
@@ -61,6 +62,8 @@ pub struct WorkerEnv {
     pub repro_writer: Option<ReproWriter>,
     /// Snapshot of `out/build-info/` taken at campaign start. See `Env`.
     pub build_info_snapshot_dir: Option<std::path::PathBuf>,
+    /// Hot reload flag: when set, workers skip shrinking on stop
+    pub reload_flag: Arc<AtomicBool>,
 }
 
 impl From<&Env> for WorkerEnv {
@@ -91,6 +94,7 @@ impl From<&Env> for WorkerEnv {
             setup_dict_tuples: env.setup_dict_tuples.clone(),
             repro_writer: env.repro_writer.clone(),
             build_info_snapshot_dir: env.build_info_snapshot_dir.clone(),
+            reload_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }

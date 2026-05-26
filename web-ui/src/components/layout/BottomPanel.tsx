@@ -23,18 +23,18 @@ interface BottomPanelProps {
 }
 
 export default function BottomPanel({ expanded, onToggle }: BottomPanelProps) {
-  const [activeTab, setActiveTab] = useState<BottomTab>('reverts');
+  const [activeTab, setActiveTab] = useState<BottomTab>('sequence');
 
   return (
     <div className="h-full flex flex-col bg-zinc-900 border-t border-zinc-800">
       {/* Header */}
       <div className="flex items-center justify-between px-3 h-8 flex-shrink-0 border-b border-zinc-800">
         <div className="flex items-center gap-4">
-          <TabButton
+          {/* <TabButton
             active={activeTab === 'reverts'}
             onClick={() => setActiveTab('reverts')}
             label="Revert Hotspots"
-          />
+          /> */}
           <TabButton
             active={activeTab === 'sequence'}
             onClick={() => setActiveTab('sequence')}

@@ -32,6 +32,8 @@ serde = { workspace = true, features = ["derive"] }
 alloy-json-abi.workspace = true
 crossbeam-channel = "0.5"
 dirs = "6.0.0"
+notify = "8"
+notify-debouncer-mini = "0.7"
 
 [dev-dependencies]
 abi.workspace = true

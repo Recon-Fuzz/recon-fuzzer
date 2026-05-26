@@ -34,6 +34,7 @@ pub fn run_campaign(
     initial_corpus: Vec<CorpusEntry>,
     stop_flag: Arc<AtomicBool>,
     force_stop: Arc<AtomicBool>,
+    reload_flag: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
 
@@ -112,6 +113,7 @@ pub fn run_campaign(
             tracing::debug!("Creating worker {}", worker_id);
             let stop_flag = stop_flag.clone();
             let force_stop = force_stop.clone();
+            let reload_flag = reload_flag.clone();
             let total_calls = total_calls.clone();
             let total_gas = total_gas.clone();
             let test_refs = test_refs.clone();
@@ -177,6 +179,7 @@ pub fn run_campaign(
                     setup_dict_tuples: setup_dict_tuples.clone(),
                     repro_writer: repro_writer.clone(),
                     build_info_snapshot_dir,
+                    reload_flag: reload_flag.clone(),
                 };
 
                 let mut worker = WorkerState::new(worker_id, worker_seed);
@@ -429,6 +432,7 @@ pub fn run_shrink_campaign(
                     setup_dict_tuples,
                     repro_writer,
                     build_info_snapshot_dir,
+                    reload_flag: Arc::new(AtomicBool::new(false)),
                 };
 
                 let worker = WorkerState::new(worker_id, worker_seed);
@@ -632,9 +636,10 @@ fn run_fuzz_worker(
     loop {
         tracing::trace!("Worker {} entering main fuzzing loop", worker.worker_id);
         if stop_flag.load(Ordering::Relaxed) {
-            // On interrupt, close optimization tests and shrink them before exiting
-            // This matches the behavior at test_limit
-            close_and_shrink_optimization_tests(env, &initial_vm, worker, &mut rng, &force_stop)?;
+            if !env.reload_flag.load(Ordering::Relaxed) {
+                // Normal interrupt: close optimization tests and shrink before exiting
+                close_and_shrink_optimization_tests(env, &initial_vm, worker, &mut rng, &force_stop)?;
+            }
             return Ok(WorkerStopReason::Stopped);
         }
 
@@ -701,20 +706,23 @@ fn run_fuzz_worker(
         }
 
         // Prioritize shrinking (| any shrinkable tests)
-        // Only this worker shrinks tests it found 
-        if any_pending_shrink_for_worker_env(env, worker.worker_id) {
+        // Only this worker shrinks tests it found
+        if !env.reload_flag.load(Ordering::Relaxed)
+            && any_pending_shrink_for_worker_env(env, worker.worker_id)
+        {
             // Use initial VM for shrinking (Echidna passes vm to shrinkTest)
             shrink_pending_tests_worker(env, &initial_vm, worker, &mut rng, &force_stop)?;
             // Check for stop after shrinking
             if stop_flag.load(Ordering::Relaxed) {
-                // On interrupt, close optimization tests and shrink them before exiting
-                close_and_shrink_optimization_tests(
-                    env,
-                    &initial_vm,
-                    worker,
-                    &mut rng,
-                    &force_stop,
-                )?;
+                if !env.reload_flag.load(Ordering::Relaxed) {
+                    close_and_shrink_optimization_tests(
+                        env,
+                        &initial_vm,
+                        worker,
+                        &mut rng,
+                        &force_stop,
+                    )?;
+                }
                 return Ok(WorkerStopReason::Stopped);
             }
             continue;

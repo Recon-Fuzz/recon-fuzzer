@@ -244,6 +244,7 @@ export const useFuzzerStore = create<FuzzerState>()(
       set({
         contracts: payload.contracts,
         sourceFiles: payload.sourceFiles,
+        sourceFileContents: new Map(),
         config: payload.config,
         workerInfo: payload.workers,
         corpus: limitedCorpus,

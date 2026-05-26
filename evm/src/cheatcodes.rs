@@ -530,6 +530,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                             memory_offset: inputs.return_memory_offset.clone(),
                             precompile_call_logs: vec![],
                             was_precompile_called: false,
+                            charged_new_account_state_gas: false,
                         });
                     }
                     
@@ -547,6 +548,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                         memory_offset: inputs.return_memory_offset.clone(),
                         precompile_call_logs: vec![],
                         was_precompile_called: false,
+                        charged_new_account_state_gas: false,
                     });
                 }
             }
@@ -566,6 +568,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                     memory_offset: inputs.return_memory_offset.clone(),
                     precompile_call_logs: vec![],
                     was_precompile_called: false,
+                    charged_new_account_state_gas: false,
                 });
             }
             
@@ -588,6 +591,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                         memory_offset: inputs.return_memory_offset.clone(),
                         precompile_call_logs: vec![],
                         was_precompile_called: false,
+                        charged_new_account_state_gas: false,
                     });
                 }
             }
@@ -615,6 +619,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                         memory_offset: inputs.return_memory_offset.clone(),
                         precompile_call_logs: vec![],
                         was_precompile_called: false,
+                        charged_new_account_state_gas: false,
                     });
                 }
             }
@@ -634,6 +639,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                         memory_offset: inputs.return_memory_offset.clone(),
                         precompile_call_logs: vec![],
                         was_precompile_called: false,
+                        charged_new_account_state_gas: false,
                     });
                 }
             }
@@ -663,6 +669,7 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                 memory_offset: inputs.return_memory_offset.clone(),
                 precompile_call_logs: vec![],
                 was_precompile_called: false,
+                charged_new_account_state_gas: false,
             });
         }
         

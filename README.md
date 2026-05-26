@@ -147,6 +147,24 @@ Examples below.
 | `--format text\|json\|none` | Output format for the final report |
 | `--shortcuts` | Run `shortcut_*` functions at startup to bootstrap the corpus |
 | `--shrink-limit <N>` | Shrink attempts per failing test (default: 5000) |
+| `--hot-reload` | Watch `.sol` files and restart campaign on recompilation |
+
+## Hot Reload
+
+Pass `--hot-reload` to automatically restart the campaign when Solidity files change:
+
+```bash
+recon fuzz . --hot-reload
+recon fuzz . --hot-reload --web
+```
+
+When a `.sol` file is modified, Recon recompiles in the background (workers keep running), then restarts the campaign with fresh bytecode. The existing corpus is preserved and replayed against the new code. Coverage maps, tests, and EVM state are fully reset.
+
+Can also be enabled via config:
+
+```yaml
+hotReload: true
+```
 
 ## Web UI (experimental)
 
