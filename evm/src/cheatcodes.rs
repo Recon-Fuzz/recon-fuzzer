@@ -104,6 +104,7 @@ pub struct CheatcodeState {
     pub roll_block: Option<U256>,
     /// Chain id override (vm.chainId)
     pub chain_id: Option<U256>,
+    pub has_opcode_cheatcodes: bool,
     /// Labels for addresses
     pub labels: HashMap<Address, String>,
     /// Whether assume failed (skip this tx)
@@ -330,6 +331,7 @@ impl CheatcodeInspector {
         if selector == warpCall::SELECTOR {
             if let Ok(decoded) = warpCall::abi_decode(input) {
                 self.state.warp_timestamp = Some(decoded.newTimestamp);
+                self.state.has_opcode_cheatcodes = true;
                 return Some(Bytes::new());
             }
         }
@@ -338,6 +340,7 @@ impl CheatcodeInspector {
         if selector == rollCall::SELECTOR {
             if let Ok(decoded) = rollCall::abi_decode(input) {
                 self.state.roll_block = Some(decoded.newNumber);
+                self.state.has_opcode_cheatcodes = true;
                 return Some(Bytes::new());
             }
         }
@@ -346,6 +349,7 @@ impl CheatcodeInspector {
         if selector == chainIdCall::SELECTOR {
             if let Ok(decoded) = chainIdCall::abi_decode(input) {
                 self.state.chain_id = Some(decoded.newChainId);
+                self.state.has_opcode_cheatcodes = true;
                 return Some(Bytes::new());
             }
         }
@@ -462,6 +466,10 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
     }
     
     fn step_end(&mut self, interp: &mut Interpreter<INTR>, _context: &mut CTX) {
+        if !self.state.has_opcode_cheatcodes {
+            self.last_opcode = 0;
+            return;
+        }
         // Handle vm.warp() - override TIMESTAMP opcode result
         // TIMESTAMP (0x42) pushes block.timestamp to stack
         // If warp is active, replace with our warped value
