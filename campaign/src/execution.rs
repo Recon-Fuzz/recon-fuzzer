@@ -21,24 +21,27 @@ use crate::worker_env::{CorpusEntry, WorkerEnv};
 pub fn add_return_value_to_dict(dict: &mut GenDict, val: alloy_dyn_abi::DynSolValue) {
     use alloy_dyn_abi::DynSolValue;
 
-    // Decompose first while we still have a borrow, then move val into add_value
-    match &val {
-        // For tuples/structs, also extract each element individually
+    match val {
         DynSolValue::Tuple(elements) => {
+            dict.add_value(DynSolValue::Tuple(elements.clone()));
             for elem in elements {
-                add_return_value_to_dict(dict, elem.clone());
+                add_return_value_to_dict(dict, elem);
             }
         }
-        // For arrays, also extract each element
-        DynSolValue::Array(elements) | DynSolValue::FixedArray(elements) => {
+        DynSolValue::Array(elements) => {
+            dict.add_value(DynSolValue::Array(elements.clone()));
             for elem in elements {
-                add_return_value_to_dict(dict, elem.clone());
+                add_return_value_to_dict(dict, elem);
             }
         }
-        _ => {}
+        DynSolValue::FixedArray(elements) => {
+            dict.add_value(DynSolValue::FixedArray(elements.clone()));
+            for elem in elements {
+                add_return_value_to_dict(dict, elem);
+            }
+        }
+        other => dict.add_value(other),
     }
-    // Move val — no clone needed here
-    dict.add_value(val);
 }
 
 /// Extract dictionary values from call traces at ALL depths
