@@ -49,6 +49,11 @@ impl std::fmt::Display for TestMode {
     }
 }
 
+/// Default for `filter_blacklist` — matches echidna's `filterBlacklist: true`.
+fn default_filter_blacklist() -> bool {
+    true
+}
+
 /// Solidity/compilation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -76,6 +81,19 @@ pub struct SolConf {
 
     /// Only fuzz state-mutating functions (exclude pure/view)
     pub mutable_only: bool,
+
+    /// Echidna-compatible: functions to filter from fuzzing. Entries use the
+    /// canonical form `Contract.func(type1,type2)`. Interpreted as a blacklist
+    /// or whitelist depending on `filter_blacklist`. Empty = no filtering.
+    #[serde(default, alias = "filterFunctions")]
+    pub filter_functions: Vec<String>,
+
+    /// Echidna-compatible: when true (default), `filter_functions` is a
+    /// blacklist (those functions are excluded from fuzzing); when false, it is
+    /// a whitelist (only those functions are fuzzed). Mirrors echidna's
+    /// `filterBlacklist`.
+    #[serde(default = "default_filter_blacklist", alias = "filterBlacklist")]
+    pub filter_blacklist: bool,
 
     /// Initial ETH balance funded into deployer and each sender address.
     /// Mirrors echidna's `balanceAddr` (default 0xffffffff = ~4.29e9 wei).
@@ -115,6 +133,8 @@ impl Default for SolConf {
             test_mode: TestMode::Property,
             all_contracts: false,
             mutable_only: false,
+            filter_functions: Vec::new(),
+            filter_blacklist: default_filter_blacklist(),
             balance_addr: None,
             balance_contract: U256::ZERO,
             chain_id: None,

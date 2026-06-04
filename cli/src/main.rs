@@ -133,6 +133,16 @@ struct FuzzArgs {
     #[arg(long)]
     mutable_only: bool,
 
+    /// Functions to filter from fuzzing (echidna `filterFunctions`).
+    /// Format: "Contract.func(type1,type2)". Repeatable.
+    #[arg(long)]
+    filter_functions: Vec<String>,
+
+    /// Treat --filter-functions as a whitelist (fuzz ONLY those). Default is a
+    /// blacklist (exclude those), matching echidna's `filterBlacklist: true`.
+    #[arg(long)]
+    filter_whitelist: bool,
+
     /// Replay a corpus file and show traces (e.g., --replay echidna/reproducers/foo.txt)
     #[arg(long)]
     replay: Option<PathBuf>,
@@ -315,6 +325,14 @@ struct FlatConfig {
     all_contracts: Option<bool>,
     #[serde(rename = "mutableOnly")]
     mutable_only: Option<bool>,
+    /// Echidna-compatible: functions to filter from fuzzing, as canonical
+    /// `Contract.func(types)` signatures.
+    #[serde(rename = "filterFunctions")]
+    filter_functions: Option<Vec<String>>,
+    /// Echidna-compatible: treat `filterFunctions` as a blacklist (default) or
+    /// whitelist (`false`).
+    #[serde(rename = "filterBlacklist")]
+    filter_blacklist: Option<bool>,
     /// Echidna-compatible: initial ETH balance funded into deployer/senders.
     #[serde(
         rename = "balanceAddr",
@@ -535,6 +553,12 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         if let Some(mutable) = flat.mutable_only {
             config.sol_conf.mutable_only = mutable;
         }
+        if let Some(funcs) = flat.filter_functions {
+            config.sol_conf.filter_functions = funcs;
+        }
+        if let Some(blacklist) = flat.filter_blacklist {
+            config.sol_conf.filter_blacklist = blacklist;
+        }
         if let Some(bal) = flat.balance_addr {
             config.sol_conf.balance_addr = Some(bal);
         }
@@ -601,6 +625,12 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     }
     if args.mutable_only {
         config.sol_conf.mutable_only = true;
+    }
+    if !args.filter_functions.is_empty() {
+        config.sol_conf.filter_functions = args.filter_functions.clone();
+    }
+    if args.filter_whitelist {
+        config.sol_conf.filter_blacklist = false;
     }
     if args.lcov {
         config.campaign_conf.lcov_enable = true;
@@ -870,6 +900,47 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                     excluded
                 );
                 main_contract.exclude_from_fuzzing = excluded.to_vec();
+            }
+        }
+
+        // Apply Echidna-style function filter (filterFunctions / filterBlacklist).
+        // Entries are namespaced by contract (`Contract.func(types)`), so the same
+        // filter is safely stamped onto every loaded contract; each keeps only the
+        // entries naming it. The filter is enforced inside CompiledContract::
+        // fuzzable_functions[_smart] — the single choke point every transaction-
+        // generation path draws from — so it covers main and (future) all-contracts.
+        if !config.sol_conf.filter_functions.is_empty() {
+            let filter = evm::foundry::FunctionFilter {
+                blacklist: config.sol_conf.filter_blacklist,
+                functions: config.sol_conf.filter_functions.clone(),
+            };
+            info!(
+                "Function filter active ({}): {:?}",
+                if filter.blacklist {
+                    "blacklist — excluding these"
+                } else {
+                    "whitelist — fuzzing only these"
+                },
+                filter.functions
+            );
+            main_contract.fuzz_filter = filter.clone();
+            for contract in project.contracts.iter_mut() {
+                contract.fuzz_filter = filter.clone();
+            }
+
+            // Warn loudly if a whitelist removed every fuzzable function on the
+            // main contract — that would silently produce a no-op campaign.
+            if !filter.blacklist
+                && main_contract
+                    .fuzzable_functions(config.sol_conf.mutable_only)
+                    .is_empty()
+            {
+                warn!(
+                    "filterFunctions whitelist matched no fuzzable functions on '{}' — \
+                     no functions will be called. Check the canonical signatures \
+                     (e.g. \"{}.func(uint256)\").",
+                    main_contract.name, main_contract.name
+                );
             }
         }
 
