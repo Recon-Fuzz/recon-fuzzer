@@ -17,6 +17,80 @@ use crate::exec::EvmState;
 // Keep Libraries type for API compatibility, but we don't use foundry-linking
 type Libraries = std::collections::BTreeMap<PathBuf, std::collections::BTreeMap<String, String>>;
 
+/// Echidna-style function filter applied to the fuzzable function set.
+///
+/// Mirrors Echidna's `filterFunctions` + `filterBlacklist` config knobs:
+/// - `blacklist == true` (Echidna's default): the listed functions are
+///   EXCLUDED from fuzzing; everything else is fuzzed.
+/// - `blacklist == false` (whitelist): ONLY the listed functions are fuzzed.
+///
+/// Entries use Echidna's canonical form `Contract.func(type1,type2)`. For
+/// convenience we additionally accept looser forms — the bare signature
+/// `func(types)`, the qualified name `Contract.func`, and the bare name
+/// `func` — so any entry Echidna would match, we match too.
+///
+/// An empty `functions` list means the filter is inactive (no-op) regardless
+/// of `blacklist`, which keeps the default and the degenerate empty-whitelist
+/// case from silently disabling all fuzzing.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionFilter {
+    /// When true, `functions` is a blacklist (exclude); when false, a whitelist
+    /// (include only). Echidna's `filterBlacklist`, default `true`.
+    pub blacklist: bool,
+    /// Function identifiers to match, e.g. `["Token.transfer(address,uint256)"]`.
+    pub functions: Vec<String>,
+}
+
+impl FunctionFilter {
+    /// True when the filter actually constrains the function set.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        !self.functions.is_empty()
+    }
+
+    /// Whether `func` on contract `contract_name` should be kept for fuzzing.
+    pub fn allows(&self, contract_name: &str, func: &Function) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        let listed = self.matches(contract_name, func);
+        // blacklist: keep when NOT listed; whitelist: keep when listed.
+        if self.blacklist {
+            !listed
+        } else {
+            listed
+        }
+    }
+
+    /// True if `func` matches any configured entry, in any accepted form.
+    fn matches(&self, contract_name: &str, func: &Function) -> bool {
+        // Canonical comma-joined Solidity type list, e.g. "address,uint256"
+        // (uses resolved types so tuples render as "(uint128,uint128)" rather
+        // than the bare "tuple" you'd get from Param::ty).
+        let types = func
+            .inputs
+            .iter()
+            .map(|p| {
+                p.resolve()
+                    .map(|t| t.sol_type_name().to_string())
+                    .unwrap_or_else(|_| p.ty.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sig = format!("{}({})", func.name, types);
+        let qualified_sig = format!("{}.{}", contract_name, sig);
+        let qualified_name = format!("{}.{}", contract_name, func.name);
+
+        self.functions.iter().any(|e| {
+            let e = e.trim();
+            e == qualified_sig   // Contract.func(types)  — Echidna canonical
+                || e == sig          // func(types)
+                || e == qualified_name // Contract.func
+                || e == func.name // func
+        })
+    }
+}
+
 /// Compiled contract from Foundry
 #[derive(Debug, Clone)]
 pub struct CompiledContract {
@@ -54,6 +128,10 @@ pub struct CompiledContract {
     /// Functions to exclude from fuzzing (e.g., callback handlers like "onCallback")
     /// Contains function names WITHOUT parameters
     pub exclude_from_fuzzing: Vec<String>,
+
+    /// Echidna-style function filter (`filterFunctions` + `filterBlacklist`).
+    /// Inactive by default (empty list = fuzz everything).
+    pub fuzz_filter: FunctionFilter,
 
     /// Foundry artifact's top-level `id` field — the file id of this contract's
     /// own source within the build-info that compiled it. Combined with
@@ -122,6 +200,8 @@ impl CompiledContract {
             .filter(|f| !Self::is_foundry_internal(&f.name))
             // Filter out excluded functions (matched by name without params)
             .filter(|f| !self.exclude_from_fuzzing.iter().any(|excluded| excluded == &f.name))
+            // Apply Echidna-style filterFunctions/filterBlacklist
+            .filter(|f| self.fuzz_filter.allows(&self.name, f))
             .collect()
     }
     
@@ -149,6 +229,11 @@ impl CompiledContract {
 
                 // Filter out excluded functions (matched by name without params)
                 if self.exclude_from_fuzzing.iter().any(|excluded| excluded == &f.name) {
+                    return false;
+                }
+
+                // Apply Echidna-style filterFunctions/filterBlacklist
+                if !self.fuzz_filter.allows(&self.name, f) {
                     return false;
                 }
 
@@ -386,6 +471,7 @@ fn parse_single_artifact(path: &Path, name: &str) -> Result<Option<CompiledContr
         init_source_map: artifact.bytecode.source_map,
         resolved_param_types,
         exclude_from_fuzzing: Vec::new(),
+        fuzz_filter: FunctionFilter::default(),
         source_file_id: artifact.id,
         storage_layout: artifact.storage_layout,
     }))
