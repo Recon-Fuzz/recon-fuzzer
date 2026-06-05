@@ -177,7 +177,7 @@ pub struct GenDict {
     pub constants: FxHashMap<ValueKind, Vec<DynSolValue>>,
 
     /// Complete calls seen during fuzzing, for replay
-    pub whole_calls: FxHashMap<SolSignature, Vec<SolCall>>,
+    pub whole_calls: FxHashMap<String, Vec<SolCall>>,
 
     /// RNG seed
     pub seed: u64,
@@ -462,13 +462,16 @@ impl GenDict {
 
     /// Add a call to the dictionary
     pub fn add_call(&mut self, call: SolCall) {
-        let sig = (
-            call.0.clone(),
-            call.1
-                .iter()
-                .map(|v| v.sol_type_name().map(|s| s.to_string()).unwrap_or_default())
-                .collect(),
-        );
+        let mut sig = String::with_capacity(call.0.len() + 32);
+        sig.push_str(&call.0);
+        sig.push('(');
+        for (i, v) in call.1.iter().enumerate() {
+            if i > 0 {
+                sig.push(',');
+            }
+            sig.push_str(v.sol_type_name().as_deref().unwrap_or(""));
+        }
+        sig.push(')');
         self.whole_calls.entry(sig).or_default().push(call);
     }
 

@@ -656,7 +656,9 @@ const OP_JUMPDEST: u8 = 0x5B;
 impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedInspector {
     fn step(&mut self, interp: &mut Interpreter<INTR>, context: &mut CTX) {
         // Delegate to cheatcode inspector for opcode tracking (warp/roll)
-        self.cheatcode.step(interp, context);
+        if self.cheatcode.state.has_opcode_cheatcodes {
+            self.cheatcode.step(interp, context);
+        }
 
         // Get the opcode being executed FIRST for early exit in branch mode
         let pc = interp.bytecode.pc();
@@ -742,7 +744,9 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedIn
 
     fn step_end(&mut self, interp: &mut Interpreter<INTR>, context: &mut CTX) {
         // Delegate to cheatcode inspector for warp/roll handling
-        self.cheatcode.step_end(interp, context);
+        if self.cheatcode.state.has_opcode_cheatcodes {
+            self.cheatcode.step_end(interp, context);
+        }
     }
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {

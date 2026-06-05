@@ -45,17 +45,13 @@ fn expand_at<T: Clone>(xs: &[T], k: usize, t: usize) -> Vec<T> {
     if xs.is_empty() {
         return Vec::new();
     }
-    if k == 0 {
-        let mut res = Vec::with_capacity(xs.len() + t);
-        res.extend(std::iter::repeat(xs[0].clone()).take(t));
-        res.extend_from_slice(&xs[1..]);
-        res
-    } else {
-        let mut res = Vec::with_capacity(xs.len() + t);
-        res.push(xs[0].clone());
-        res.extend(expand_at(&xs[1..], k - 1, t));
-        res
+    let mut res = Vec::with_capacity(xs.len() + t);
+    res.extend_from_slice(&xs[..k]);
+    for _ in 0..t {
+        res.push(xs[k].clone());
     }
+    res.extend_from_slice(&xs[k + 1..]);
+    res
 }
 
 pub fn swap_rand_list<R: Rng, T: Clone>(rng: &mut R, txs: &[T]) -> Vec<T> {

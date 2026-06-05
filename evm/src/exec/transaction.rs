@@ -896,69 +896,91 @@ impl EvmState {
 
         if !inspector.touched.is_empty() {
             let len = inspector.touched.len();
+            let touched = &inspector.touched;
 
-            // First pass: check if any of our coverage might be new (with read lock)
+            // First pass: check if any of our coverage might be new (with read lock).
+            // Consecutive opcodes in the same call frame share a codehash, so fetch the
+            // per-contract map once per contiguous run instead of per opcode (the outer
+            // FxHashMap<B256,_> lookup on a 32-byte key was repeated for every opcode).
             let might_have_new = {
                 let coverage = coverage_ref.read();
-
-                inspector
-                    .touched
-                    .iter()
-                    .enumerate()
-                    .any(|(idx, &(codehash, pc, stack_depth))| {
+                let mut found_new = false;
+                let mut i = 0;
+                'outer: while i < len {
+                    let codehash = touched[i].0;
+                    let contract_cov = coverage.get(&codehash);
+                    let mut j = i;
+                    while j < len && touched[j].0 == codehash {
+                        let (_, pc, stack_depth) = touched[j];
                         let depth_bit = if stack_depth < 64 {
                             1u64 << stack_depth
                         } else {
                             1u64 << 63
                         };
 
-                        // Result bit ONLY checked for last PC 
-                        let is_last_pc = idx == len - 1;
+                        // Result bit ONLY checked for last PC
+                        let is_last_pc = j == len - 1;
 
-                        if let Some(contract_cov) = coverage.get(&codehash) {
-                            if let Some(&(depths, results)) = contract_cov.get(&pc) {
-                                let new_depth = (depths & depth_bit) == 0;
-                                let new_result = is_last_pc && (results & result_bit) == 0;
-                                new_depth || new_result
-                            } else {
-                                true // New PC = new coverage
-                            }
-                        } else {
-                            true // New codehash = new coverage
+                        let is_new = match contract_cov {
+                            Some(cc) => match cc.get(&pc) {
+                                Some(&(depths, results)) => {
+                                    let new_depth = (depths & depth_bit) == 0;
+                                    let new_result = is_last_pc && (results & result_bit) == 0;
+                                    new_depth || new_result
+                                }
+                                None => true, // New PC = new coverage
+                            },
+                            None => true, // New codehash = new coverage
+                        };
+
+                        if is_new {
+                            found_new = true;
+                            break 'outer;
                         }
-                    })
+                        j += 1;
+                    }
+                    i = j;
+                }
+                found_new
             };
 
-            // Second pass: ONLY if we might have new coverage, take write lock and merge
+            // Second pass: ONLY if we might have new coverage, take write lock and merge.
+            // Same run-grouping — one outer entry() per contiguous codehash run.
             if might_have_new {
                 let mut coverage = coverage_ref.write();
-
-                for (idx, &(codehash, pc, stack_depth)) in inspector.touched.iter().enumerate() {
+                let mut i = 0;
+                while i < len {
+                    let codehash = touched[i].0;
                     let contract_cov = coverage.entry(codehash).or_insert_with(FxHashMap::default);
+                    let mut j = i;
+                    while j < len && touched[j].0 == codehash {
+                        let (_, pc, stack_depth) = touched[j];
+                        let depth_bit = if stack_depth < 64 {
+                            1u64 << stack_depth
+                        } else {
+                            1u64 << 63
+                        };
 
-                    let depth_bit = if stack_depth < 64 {
-                        1u64 << stack_depth
-                    } else {
-                        1u64 << 63
-                    };
+                        // Result bit ONLY applied to last PC
+                        let is_last_pc = j == len - 1;
 
-                    // Result bit ONLY applied to last PC 
-                    let is_last_pc = idx == len - 1;
+                        let entry = contract_cov.entry(pc).or_insert((0, 0));
+                        let new_depth = (entry.0 & depth_bit) == 0;
+                        let new_result = is_last_pc && (entry.1 & result_bit) == 0;
 
-                    let entry = contract_cov.entry(pc).or_insert((0, 0));
-                    let new_depth = (entry.0 & depth_bit) == 0;
-                    let new_result = is_last_pc && (entry.1 & result_bit) == 0;
+                        if new_depth || new_result {
+                            has_new_coverage = true;
+                        }
 
-                    if new_depth || new_result {
-                        has_new_coverage = true;
+                        // Always update depth bit for all PCs
+                        entry.0 |= depth_bit;
+                        // Result bit ONLY for last PC
+                        if is_last_pc {
+                            entry.1 |= result_bit;
+                        }
+                        j += 1;
                     }
-
-                    // Always update depth bit for all PCs
-                    entry.0 |= depth_bit;
-                    // Result bit ONLY for last PC
-                    if is_last_pc {
-                        entry.1 |= result_bit;
-                    }
+                    i = j;
                 }
             }
         }

@@ -380,13 +380,16 @@ pub fn gen_abi_call_m<R: Rng>(
 
     // Step 3: Optionally lookup whole_calls (maybeValM) — build sig only when needed
     let sol_call = if should_use_whole_calls {
-        let sig = (
-            name.to_string(),
-            param_types
-                .iter()
-                .map(|t| t.sol_type_name().to_string())
-                .collect::<Vec<String>>(),
-        );
+        let mut sig = String::with_capacity(name.len() + 32);
+        sig.push_str(name);
+        sig.push('(');
+        for (i, t) in param_types.iter().enumerate() {
+            if i > 0 {
+                sig.push(',');
+            }
+            sig.push_str(&t.sol_type_name());
+        }
+        sig.push(')');
         if let Some(calls) = dict.whole_calls.get(&sig) {
             if !calls.is_empty() {
                 let idx = rng.gen_range(0..calls.len());
@@ -483,20 +486,28 @@ mod tests {
         assert_eq!(args.len(), 1);
 
         // Verify signature format matches
-        let sig_from_type = (
-            "initSequence".to_string(),
-            param_types
-                .iter()
-                .map(|t| t.sol_type_name().to_string())
-                .collect::<Vec<_>>(),
-        );
-        let sig_from_value = (
-            call_name,
-            call_args
-                .iter()
-                .map(|v| v.sol_type_name().map(|s| s.to_string()).unwrap_or_default())
-                .collect::<Vec<_>>(),
-        );
+        let sig_from_type: String = {
+            let mut s = String::with_capacity(32);
+            s.push_str("initSequence");
+            s.push('(');
+            for (i, t) in param_types.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(&t.sol_type_name());
+            }
+            s.push(')');
+            s
+        };
+        let sig_from_value: String = {
+            let mut s = String::with_capacity(32);
+            s.push_str(&call_name);
+            s.push('(');
+            for (i, v) in call_args.iter().enumerate() {
+                if i > 0 { s.push(','); }
+                s.push_str(v.sol_type_name().as_deref().unwrap_or(""));
+            }
+            s.push(')');
+            s
+        };
         assert_eq!(
             sig_from_type, sig_from_value,
             "Signature format mismatch between DynSolType and DynSolValue!"
