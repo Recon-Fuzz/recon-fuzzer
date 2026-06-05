@@ -275,7 +275,6 @@ fn intern_type(
         let mut members = Vec::new();
         let mut member_slot: usize = 0;
         let mut member_offset: usize = 0;
-        let mut total_bytes: usize = 0;
 
         for field_str in &fields {
             let (m_type_str, m_name) = split_type_and_name(field_str.trim())?;
@@ -316,16 +315,12 @@ fn intern_type(
             }
         }
 
-        total_bytes = if member_offset > 0 {
-            (member_slot) * 32 + member_offset
+        let raw = if member_offset > 0 {
+            member_slot * 32 + member_offset
         } else {
             member_slot * 32
         };
-        // Round up to 32-byte boundary for struct size
-        total_bytes = ((total_bytes + 31) / 32) * 32;
-        if total_bytes == 0 {
-            total_bytes = 32;
-        }
+        let total_bytes = if raw == 0 { 32 } else { ((raw + 31) / 32) * 32 };
 
         *counter += 1;
         let type_id = format!("t_struct(anon){}_storage", counter);
@@ -999,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_bytesN() {
+    fn test_all_bytes_n() {
         for n in 1..=32 {
             let input = format!("bytes{} x", n);
             let l = parse_compact(&input).unwrap();
