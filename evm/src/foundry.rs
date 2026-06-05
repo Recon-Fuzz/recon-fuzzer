@@ -61,6 +61,10 @@ pub struct CompiledContract {
     /// to so source-map file ids can be remapped correctly when multiple
     /// build-info JSON files coexist (different solc versions / profiles).
     pub source_file_id: Option<i32>,
+
+    /// Parsed storage layout from `forge inspect`. Populated by
+    /// `load_storage_layouts()` at startup; `None` for interfaces/libraries.
+    pub storage_layout: Option<crate::storage_layout::StorageLayout>,
 }
 
 impl CompiledContract {
@@ -204,6 +208,9 @@ struct FoundryArtifact {
     /// when multiple build-info files coexist.
     #[serde(default)]
     id: Option<i32>,
+    /// Solc storage layout (available when built with `--extra-output storageLayout`).
+    #[serde(rename = "storageLayout", default)]
+    storage_layout: Option<crate::storage_layout::StorageLayout>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +228,8 @@ pub fn compile_project(project_path: &Path) -> Result<Vec<CompiledContract>> {
     let output = Command::new("forge")
         .arg("build")
         .arg("--build-info")
+        .arg("--extra-output")
+        .arg("storageLayout")
         .arg("-o")
         .arg("out")
         .current_dir(project_path)
@@ -378,6 +387,7 @@ fn parse_single_artifact(path: &Path, name: &str) -> Result<Option<CompiledContr
         resolved_param_types,
         exclude_from_fuzzing: Vec::new(),
         source_file_id: artifact.id,
+        storage_layout: artifact.storage_layout,
     }))
 }
 
@@ -400,6 +410,8 @@ fn parse_bytecode_with_placeholders(object: &str) -> Result<Bytes> {
     Ok(Bytes::from(bytes))
 }
 
+/// Load storage layouts for all contracts by calling `forge inspect <name> storageLayout --json`.
+/// Called once at startup. Contracts whose layout can't be loaded (interfaces, libraries) are skipped.
 /// Extract all __$hash$__ placeholders from a bytecode hex string
 /// Returns a set of unique hashes (the 34-char string between __$ and $__)
 fn extract_library_placeholders(bytecode_hex: &str) -> HashSet<String> {
@@ -484,11 +496,13 @@ impl FoundryProject {
     /// Compile and prepare for linking
     pub fn compile(project_path: &Path) -> Result<Self> {
         info!("Compiling Foundry project at {:?}", project_path);
-        
+
         // Run forge build first
         let output = Command::new("forge")
             .arg("build")
             .arg("--build-info")
+            .arg("--extra-output")
+            .arg("storageLayout")
             .arg("-o")
             .arg("out")
             .current_dir(project_path)
@@ -499,7 +513,13 @@ impl FoundryProject {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("forge build failed: {}", stderr));
         }
-        
+
+        Self::load(project_path)
+    }
+
+    /// Load already-compiled artifacts from `out/` without running `forge build`.
+    /// Use after an external build (e.g. hot reload watcher) has already compiled.
+    pub fn load(project_path: &Path) -> Result<Self> {
         // Parse all artifacts to find contracts and libraries
         let out_dir = project_path.join("out");
         let mut contracts = Vec::new();

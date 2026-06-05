@@ -83,6 +83,8 @@ impl EvmState {
         // - DeploymentPcCounter tracks coverage without touching cheatcode handling
         // - TracingInspector captures call traces for dictionary extraction
         let mut cheatcode_inspector = crate::cheatcodes::CheatcodeInspector::new();
+        cheatcode_inspector.storage_layouts = self.storage_layouts.clone();
+        cheatcode_inspector.available_layouts = self.available_layouts.clone();
         let mut pc_counter = crate::coverage::DeploymentPcCounter::new(codehash_map.clone());
         let tracing_config = TracingInspectorConfig::default_parity()
             .with_state_diffs();
@@ -132,8 +134,24 @@ impl EvmState {
         let execution_result = result_and_state.result;
         tracing::debug!("Constructor execution result: {:?}", execution_result);
 
+        // Track the deployed contract itself plus any contracts created during
+        // its constructor (internal CREATEs). The target_addr won't have
+        // is_created()==true because we pre-inserted the account for the
+        // CALL-based deployment trick, so include it explicitly.
+        self.last_created_addresses.clear();
+        self.last_created_addresses.push(target_addr);
+        for (addr, account) in &result_and_state.state {
+            if *addr != target_addr
+                && account.is_created()
+                && account.info.code_hash != alloy_primitives::KECCAK256_EMPTY
+            {
+                self.last_created_addresses.push(*addr);
+            }
+        }
+
         // Commit state changes from constructor
         self.db.commit(result_and_state.state);
+        self.auto_register_storage_layouts();
 
         // Persist vm.warp/vm.roll/vm.chainId effects (Foundry parity)
         if let Some(warped) = cheatcode_inspector.state.warp_timestamp {
@@ -150,6 +168,8 @@ impl EvmState {
         for (addr, label) in cheatcode_inspector.state.labels.drain() {
             self.labels.insert(addr, label);
         }
+
+        self.merge_storage_layouts_from(&cheatcode_inspector.storage_layouts);
 
         // Step 3: Merge constructor coverage into the coverage map
         if !pc_counter.touched.is_empty() {
@@ -395,6 +415,8 @@ impl EvmState {
 
         // Use cheatcode inspector to handle HEVM calls.
         let mut inspector = crate::cheatcodes::CheatcodeInspector::new();
+        inspector.storage_layouts = self.storage_layouts.clone();
+        inspector.available_layouts = self.available_layouts.clone();
 
         // Wire `generate_calls_context` from the VM into the inspector so
         // shrink replays (which call exec_tx directly) reproduce the
@@ -484,6 +506,8 @@ impl EvmState {
         } else {
             // Success: Commit state changes to DB
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             // These cheatcodes should persist across transactions
@@ -565,6 +589,8 @@ impl EvmState {
 
         // 2. Build EVM with Combined Inspector (coverage + cheatcodes)
         let mut inspector = crate::coverage::CombinedInspector::new();
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
         inspector.set_coverage_mode(self.coverage_mode);
 
         // Wire `generate_calls_context` from the VM into the inspector so
@@ -640,6 +666,8 @@ impl EvmState {
             self.last_result = Some(execution_result);
         } else {
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode_state().warp_timestamp {
@@ -735,6 +763,8 @@ impl EvmState {
         // 2. Build EVM with Combined Inspector
         let mut inspector =
             crate::coverage::CombinedInspector::with_codehash_map(codehash_map.clone());
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
 
         // Set context for vm.generateCalls() cheatcode (on-demand reentrancy testing)
         if let Some(gc) = &self.generate_calls_context {
@@ -843,6 +873,8 @@ impl EvmState {
             }
 
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode_state().warp_timestamp {
@@ -990,6 +1022,8 @@ impl EvmState {
         // Build EVM with inspector (simplified - no extra tracking)
         let mut inspector =
             crate::coverage::CombinedInspector::with_codehash_map(codehash_map.clone());
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
 
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
@@ -1028,6 +1062,7 @@ impl EvmState {
         };
 
         self.last_created_addresses = inspector.created_addresses.clone();
+
         let execution_result = result_and_state.result;
         let tx_result = classify_execution_result(&execution_result);
 
@@ -1068,6 +1103,8 @@ impl EvmState {
             }
 
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode_state().warp_timestamp {
@@ -1210,6 +1247,8 @@ impl EvmState {
             .with_state_diffs()
             .record_logs();
         let mut inspector = crate::coverage::TracingWithCheatcodes::new(tracing_config);
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
 
         // Set context for vm.generateCalls() cheatcode (for trace display of reentrancy)
         if let Some(gc) = &self.generate_calls_context {
@@ -1304,6 +1343,8 @@ impl EvmState {
             }
 
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode.state.warp_timestamp {
@@ -1323,6 +1364,8 @@ impl EvmState {
         for (addr, label) in &inspector.cheatcode.state.labels {
             self.labels.insert(*addr, label.clone());
         }
+
+        self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
         // Extract storage reads captured during execution (actual SLOAD operations)
         let storage_reads = std::mem::take(&mut inspector.storage_reads);

@@ -698,14 +698,32 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
             info!("Hot reload: reinitializing campaign with new bytecode...");
         }
 
-        // Compile project
-        info!("Compiling project...");
-        let mut project =
-            FoundryProject::compile(&args.project).context("Failed to compile project")?;
+        // Compile project (hot reload: watcher already ran forge build, just parse artifacts)
+        let mut project = if is_reload {
+            info!("Loading recompiled artifacts...");
+            FoundryProject::load(&args.project).context("Failed to load project artifacts")?
+        } else {
+            info!("Compiling project...");
+            FoundryProject::compile(&args.project).context("Failed to compile project")?
+        };
 
         if project.contracts.is_empty() {
             error!("No contracts found in project");
             return Ok(());
+        }
+
+        // Check if storageLayout is present in artifacts. Forge caches builds
+        // and won't regenerate artifacts when only --extra-output changes.
+        // If missing, forge clean to bust the cache and recompile.
+        let has_storage_layout = project.contracts.iter().any(|c| c.storage_layout.is_some());
+        if !has_storage_layout {
+            info!("storageLayout missing from artifacts (stale cache), running forge clean...");
+            let _ = std::process::Command::new("forge")
+                .arg("clean")
+                .current_dir(&args.project)
+                .output();
+            project = FoundryProject::compile(&args.project)
+                .context("Failed to recompile project after forge clean")?;
         }
 
         info!("Found {} contracts", project.contracts.len());
@@ -776,18 +794,19 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                     }
                 }
 
-                // Rebuild project with --build-info
+                // Rebuild and reload artifacts (reuses FoundryProject::compile
+                // which runs forge build --build-info --extra-output storageLayout)
                 info!("Rebuilding project with --build-info...");
-                let rebuild_result = std::process::Command::new("forge")
-                    .arg("build")
-                    .arg("--build-info")
-                    .arg("-o")
-                    .arg("out")
-                    .current_dir(&args.project)
-                    .output();
+                let rebuild_result = FoundryProject::compile(&args.project);
 
                 match rebuild_result {
-                    Ok(output) if output.status.success() => {
+                    Ok(reloaded) => {
+                        project = reloaded;
+                        // Re-find main contract from refreshed artifacts
+                        main_contract = find_contract(&project.contracts, args.contract.as_deref())
+                            .context("Contract not found after rebuild")?
+                            .clone();
+
                         // Retry recon-generate info
                         match analysis::slither::SlitherInfo::load_from_recon_generate(
                             &project_path,
@@ -834,13 +853,8 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                             }
                         }
                     }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!("forge build --build-info failed: {}. Fuzzing will continue with bytecode constants only.", stderr);
-                        None
-                    }
                     Err(rebuild_err) => {
-                        warn!("Failed to run forge build: {}. Original error: {}. Fuzzing will continue with bytecode constants only.", rebuild_err, e);
+                        warn!("Rebuild failed: {}. Original error: {}. Fuzzing will continue with bytecode constants only.", rebuild_err, e);
                         None
                     }
                 }
@@ -1125,6 +1139,11 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         } else {
             println!("Contract has no constructor (or empty constructor)");
         }
+
+        // Populate storage layout registries from compiled artifacts.
+        // Layouts are parsed from the artifact JSON (forge build --extra-output storageLayout).
+        // Must happen before deployment so auto_register works for constructor-created contracts.
+        vm.set_available_layouts(&project.contracts);
 
         // Deploy with automatic library linking. The constructor msg.value is the
         // configured `balanceContract` (echidna semantics), so `address(this).balance`

@@ -935,13 +935,21 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedIn
                 }
             }
 
-            // Handle other cheatcodes - if we recognize it, return the result
-            // If we don't recognize it, still return success (empty bytes) to prevent revert
+            // Delegate to CheatcodeInspector::call() for cheatcodes that need
+            // DB/context access (vm.load, vm.loadVar, etc.).
+            // It returns Some(CallOutcome) if it handled the call.
+            if let Some(outcome) = Inspector::<CTX, INTR>::call(&mut self.cheatcode, context, inputs) {
+                if self.call_depth > 0 {
+                    self.call_depth -= 1;
+                }
+                return Some(outcome);
+            }
+
+            // Handle remaining cheatcodes that don't need DB access
             let result = self
                 .cheatcode
                 .handle_cheatcode(&input_data)
                 .unwrap_or_else(|| {
-                    // Unknown cheatcode - log it and return empty success
                     if input_data.len() >= 4 {
                         tracing::debug!(
                             "Unknown cheatcode selector: 0x{}",

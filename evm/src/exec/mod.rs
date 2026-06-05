@@ -15,6 +15,7 @@ use revm::context_interface::result::ExecutionResult;
 use revm::state::AccountInfo;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::fork::{ForkError, ForkableDb};
@@ -119,6 +120,13 @@ pub struct EvmState {
     /// determines which subset of the deterministically-generated calls is
     /// actually returned to the harness.
     pub generate_calls_context: Option<GenerateCallsRunCtx>,
+
+    /// Storage layouts keyed by contract address (for loadVar/loadVarKeys cheatcodes)
+    pub storage_layouts: Arc<HashMap<Address, crate::storage_layout::StorageLayout>>,
+    /// Available layouts by contract name (for assignStorageLayout cheatcode)
+    pub available_layouts: Arc<HashMap<String, crate::storage_layout::StorageLayout>>,
+    /// Layout lookup by metadata hash (for auto-registration on deploy)
+    pub layout_by_metadata: Arc<HashMap<alloy_primitives::B256, (String, crate::storage_layout::StorageLayout)>>,
 }
 
 /// Per-tx context for `vm.generateCalls()`. The campaign layer builds this
@@ -165,6 +173,9 @@ impl EvmState {
             last_nested_invalid_fe: false,
             last_generate_calls_records: Vec::new(),
             generate_calls_context: None,
+            storage_layouts: Arc::new(HashMap::new()),
+            available_layouts: Arc::new(HashMap::new()),
+            layout_by_metadata: Arc::new(HashMap::new()),
         };
 
         // Deploy a dummy contract at the HEVM cheatcode address
@@ -229,6 +240,9 @@ impl EvmState {
             last_nested_invalid_fe: false,
             last_generate_calls_records: Vec::new(),
             generate_calls_context: None,
+            storage_layouts: Arc::new(HashMap::new()),
+            available_layouts: Arc::new(HashMap::new()),
+            layout_by_metadata: Arc::new(HashMap::new()),
         };
 
         // Deploy HEVM cheatcode stub
