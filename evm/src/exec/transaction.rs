@@ -83,6 +83,8 @@ impl EvmState {
         // - DeploymentPcCounter tracks coverage without touching cheatcode handling
         // - TracingInspector captures call traces for dictionary extraction
         let mut cheatcode_inspector = crate::cheatcodes::CheatcodeInspector::new();
+        cheatcode_inspector.storage_layouts = self.storage_layouts.clone();
+        cheatcode_inspector.available_layouts = self.available_layouts.clone();
         let mut pc_counter = crate::coverage::DeploymentPcCounter::new(codehash_map.clone());
         let tracing_config = TracingInspectorConfig::default_parity()
             .with_state_diffs();
@@ -132,8 +134,24 @@ impl EvmState {
         let execution_result = result_and_state.result;
         tracing::debug!("Constructor execution result: {:?}", execution_result);
 
+        // Track the deployed contract itself plus any contracts created during
+        // its constructor (internal CREATEs). The target_addr won't have
+        // is_created()==true because we pre-inserted the account for the
+        // CALL-based deployment trick, so include it explicitly.
+        self.last_created_addresses.clear();
+        self.last_created_addresses.push(target_addr);
+        for (addr, account) in &result_and_state.state {
+            if *addr != target_addr
+                && account.is_created()
+                && account.info.code_hash != alloy_primitives::KECCAK256_EMPTY
+            {
+                self.last_created_addresses.push(*addr);
+            }
+        }
+
         // Commit state changes from constructor
         self.db.commit(result_and_state.state);
+        self.auto_register_storage_layouts();
 
         // Persist vm.warp/vm.roll/vm.chainId effects (Foundry parity)
         if let Some(warped) = cheatcode_inspector.state.warp_timestamp {
@@ -150,6 +168,8 @@ impl EvmState {
         for (addr, label) in cheatcode_inspector.state.labels.drain() {
             self.labels.insert(addr, label);
         }
+
+        self.merge_storage_layouts_from(&cheatcode_inspector.storage_layouts);
 
         // Step 3: Merge constructor coverage into the coverage map
         if !pc_counter.touched.is_empty() {
@@ -395,6 +415,8 @@ impl EvmState {
 
         // Use cheatcode inspector to handle HEVM calls.
         let mut inspector = crate::cheatcodes::CheatcodeInspector::new();
+        inspector.storage_layouts = self.storage_layouts.clone();
+        inspector.available_layouts = self.available_layouts.clone();
 
         // Wire `generate_calls_context` from the VM into the inspector so
         // shrink replays (which call exec_tx directly) reproduce the
@@ -484,6 +506,8 @@ impl EvmState {
         } else {
             // Success: Commit state changes to DB
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             // These cheatcodes should persist across transactions
@@ -565,6 +589,8 @@ impl EvmState {
 
         // 2. Build EVM with Combined Inspector (coverage + cheatcodes)
         let mut inspector = crate::coverage::CombinedInspector::new();
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
         inspector.set_coverage_mode(self.coverage_mode);
 
         // Wire `generate_calls_context` from the VM into the inspector so
@@ -640,6 +666,8 @@ impl EvmState {
             self.last_result = Some(execution_result);
         } else {
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode_state().warp_timestamp {
@@ -735,6 +763,8 @@ impl EvmState {
         // 2. Build EVM with Combined Inspector
         let mut inspector =
             crate::coverage::CombinedInspector::with_codehash_map(codehash_map.clone());
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
 
         // Set context for vm.generateCalls() cheatcode (on-demand reentrancy testing)
         if let Some(gc) = &self.generate_calls_context {
@@ -843,6 +873,8 @@ impl EvmState {
             }
 
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode_state().warp_timestamp {
@@ -864,69 +896,91 @@ impl EvmState {
 
         if !inspector.touched.is_empty() {
             let len = inspector.touched.len();
+            let touched = &inspector.touched;
 
-            // First pass: check if any of our coverage might be new (with read lock)
+            // First pass: check if any of our coverage might be new (with read lock).
+            // Consecutive opcodes in the same call frame share a codehash, so fetch the
+            // per-contract map once per contiguous run instead of per opcode (the outer
+            // FxHashMap<B256,_> lookup on a 32-byte key was repeated for every opcode).
             let might_have_new = {
                 let coverage = coverage_ref.read();
-
-                inspector
-                    .touched
-                    .iter()
-                    .enumerate()
-                    .any(|(idx, &(codehash, pc, stack_depth))| {
+                let mut found_new = false;
+                let mut i = 0;
+                'outer: while i < len {
+                    let codehash = touched[i].0;
+                    let contract_cov = coverage.get(&codehash);
+                    let mut j = i;
+                    while j < len && touched[j].0 == codehash {
+                        let (_, pc, stack_depth) = touched[j];
                         let depth_bit = if stack_depth < 64 {
                             1u64 << stack_depth
                         } else {
                             1u64 << 63
                         };
 
-                        // Result bit ONLY checked for last PC 
-                        let is_last_pc = idx == len - 1;
+                        // Result bit ONLY checked for last PC
+                        let is_last_pc = j == len - 1;
 
-                        if let Some(contract_cov) = coverage.get(&codehash) {
-                            if let Some(&(depths, results)) = contract_cov.get(&pc) {
-                                let new_depth = (depths & depth_bit) == 0;
-                                let new_result = is_last_pc && (results & result_bit) == 0;
-                                new_depth || new_result
-                            } else {
-                                true // New PC = new coverage
-                            }
-                        } else {
-                            true // New codehash = new coverage
+                        let is_new = match contract_cov {
+                            Some(cc) => match cc.get(&pc) {
+                                Some(&(depths, results)) => {
+                                    let new_depth = (depths & depth_bit) == 0;
+                                    let new_result = is_last_pc && (results & result_bit) == 0;
+                                    new_depth || new_result
+                                }
+                                None => true, // New PC = new coverage
+                            },
+                            None => true, // New codehash = new coverage
+                        };
+
+                        if is_new {
+                            found_new = true;
+                            break 'outer;
                         }
-                    })
+                        j += 1;
+                    }
+                    i = j;
+                }
+                found_new
             };
 
-            // Second pass: ONLY if we might have new coverage, take write lock and merge
+            // Second pass: ONLY if we might have new coverage, take write lock and merge.
+            // Same run-grouping — one outer entry() per contiguous codehash run.
             if might_have_new {
                 let mut coverage = coverage_ref.write();
-
-                for (idx, &(codehash, pc, stack_depth)) in inspector.touched.iter().enumerate() {
+                let mut i = 0;
+                while i < len {
+                    let codehash = touched[i].0;
                     let contract_cov = coverage.entry(codehash).or_insert_with(FxHashMap::default);
+                    let mut j = i;
+                    while j < len && touched[j].0 == codehash {
+                        let (_, pc, stack_depth) = touched[j];
+                        let depth_bit = if stack_depth < 64 {
+                            1u64 << stack_depth
+                        } else {
+                            1u64 << 63
+                        };
 
-                    let depth_bit = if stack_depth < 64 {
-                        1u64 << stack_depth
-                    } else {
-                        1u64 << 63
-                    };
+                        // Result bit ONLY applied to last PC
+                        let is_last_pc = j == len - 1;
 
-                    // Result bit ONLY applied to last PC 
-                    let is_last_pc = idx == len - 1;
+                        let entry = contract_cov.entry(pc).or_insert((0, 0));
+                        let new_depth = (entry.0 & depth_bit) == 0;
+                        let new_result = is_last_pc && (entry.1 & result_bit) == 0;
 
-                    let entry = contract_cov.entry(pc).or_insert((0, 0));
-                    let new_depth = (entry.0 & depth_bit) == 0;
-                    let new_result = is_last_pc && (entry.1 & result_bit) == 0;
+                        if new_depth || new_result {
+                            has_new_coverage = true;
+                        }
 
-                    if new_depth || new_result {
-                        has_new_coverage = true;
+                        // Always update depth bit for all PCs
+                        entry.0 |= depth_bit;
+                        // Result bit ONLY for last PC
+                        if is_last_pc {
+                            entry.1 |= result_bit;
+                        }
+                        j += 1;
                     }
-
-                    // Always update depth bit for all PCs
-                    entry.0 |= depth_bit;
-                    // Result bit ONLY for last PC
-                    if is_last_pc {
-                        entry.1 |= result_bit;
-                    }
+                    i = j;
                 }
             }
         }
@@ -990,6 +1044,8 @@ impl EvmState {
         // Build EVM with inspector (simplified - no extra tracking)
         let mut inspector =
             crate::coverage::CombinedInspector::with_codehash_map(codehash_map.clone());
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
 
         let ctx = Context::mainnet()
             .with_db(&mut self.db)
@@ -1028,6 +1084,7 @@ impl EvmState {
         };
 
         self.last_created_addresses = inspector.created_addresses.clone();
+
         let execution_result = result_and_state.result;
         let tx_result = classify_execution_result(&execution_result);
 
@@ -1068,6 +1125,8 @@ impl EvmState {
             }
 
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode_state().warp_timestamp {
@@ -1210,6 +1269,8 @@ impl EvmState {
             .with_state_diffs()
             .record_logs();
         let mut inspector = crate::coverage::TracingWithCheatcodes::new(tracing_config);
+        inspector.cheatcode.storage_layouts = self.storage_layouts.clone();
+        inspector.cheatcode.available_layouts = self.available_layouts.clone();
 
         // Set context for vm.generateCalls() cheatcode (for trace display of reentrancy)
         if let Some(gc) = &self.generate_calls_context {
@@ -1304,6 +1365,8 @@ impl EvmState {
             }
 
             self.db.commit(result_and_state.state);
+            self.auto_register_storage_layouts();
+            self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
             // Persist vm.warp/vm.roll effects (Foundry parity)
             if let Some(warped) = inspector.cheatcode.state.warp_timestamp {
@@ -1323,6 +1386,8 @@ impl EvmState {
         for (addr, label) in &inspector.cheatcode.state.labels {
             self.labels.insert(*addr, label.clone());
         }
+
+        self.merge_storage_layouts_from(&inspector.cheatcode.storage_layouts);
 
         // Extract storage reads captured during execution (actual SLOAD operations)
         let storage_reads = std::mem::take(&mut inspector.storage_reads);

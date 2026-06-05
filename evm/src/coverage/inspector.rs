@@ -656,7 +656,9 @@ const OP_JUMPDEST: u8 = 0x5B;
 impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedInspector {
     fn step(&mut self, interp: &mut Interpreter<INTR>, context: &mut CTX) {
         // Delegate to cheatcode inspector for opcode tracking (warp/roll)
-        self.cheatcode.step(interp, context);
+        if self.cheatcode.state.has_opcode_cheatcodes {
+            self.cheatcode.step(interp, context);
+        }
 
         // Get the opcode being executed FIRST for early exit in branch mode
         let pc = interp.bytecode.pc();
@@ -742,7 +744,9 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedIn
 
     fn step_end(&mut self, interp: &mut Interpreter<INTR>, context: &mut CTX) {
         // Delegate to cheatcode inspector for warp/roll handling
-        self.cheatcode.step_end(interp, context);
+        if self.cheatcode.state.has_opcode_cheatcodes {
+            self.cheatcode.step_end(interp, context);
+        }
     }
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
@@ -935,13 +939,21 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CombinedIn
                 }
             }
 
-            // Handle other cheatcodes - if we recognize it, return the result
-            // If we don't recognize it, still return success (empty bytes) to prevent revert
+            // Delegate to CheatcodeInspector::call() for cheatcodes that need
+            // DB/context access (vm.load, vm.loadVar, etc.).
+            // It returns Some(CallOutcome) if it handled the call.
+            if let Some(outcome) = Inspector::<CTX, INTR>::call(&mut self.cheatcode, context, inputs) {
+                if self.call_depth > 0 {
+                    self.call_depth -= 1;
+                }
+                return Some(outcome);
+            }
+
+            // Handle remaining cheatcodes that don't need DB access
             let result = self
                 .cheatcode
                 .handle_cheatcode(&input_data)
                 .unwrap_or_else(|| {
-                    // Unknown cheatcode - log it and return empty success
                     if input_data.len() >= 4 {
                         tracing::debug!(
                             "Unknown cheatcode selector: 0x{}",

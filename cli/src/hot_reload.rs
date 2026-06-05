@@ -69,6 +69,8 @@ fn watcher_loop(
                 let output = std::process::Command::new("forge")
                     .arg("build")
                     .arg("--build-info")
+                    .arg("--extra-output")
+                    .arg("storageLayout")
                     .arg("-o")
                     .arg("out")
                     .current_dir(project_dir)

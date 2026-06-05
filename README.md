@@ -147,7 +147,107 @@ Examples below.
 | `--format text\|json\|none` | Output format for the final report |
 | `--shortcuts` | Run `shortcut_*` functions at startup to bootstrap the corpus |
 | `--shrink-limit <N>` | Shrink attempts per failing test (default: 5000) |
+| `--filter-functions <SIG>` | Exclude functions from fuzzing (repeatable, Echidna `filterFunctions`) |
+| `--filter-whitelist` | Treat `--filter-functions` as a whitelist instead of blacklist |
 | `--hot-reload` | Watch `.sol` files and restart campaign on recompilation |
+
+## Storage Hooks (`Rvm.sol`)
+
+Recon extends Foundry's `vm.load`/`vm.store` with cheatcodes that read and write storage **by variable name** — no public getters needed. This enables property tests on private state, packed struct members, and mapping values.
+
+### Setup
+
+Import `Rvm.sol` from the project root:
+
+```solidity
+import "recon-fuzzer/Rvm.sol";
+```
+
+This gives you `rvm` — a global constant bound to the HEVM cheatcode address.
+
+### Reading storage
+
+```solidity
+// Read by variable name (auto-resolved from storageLayout)
+uint256 val = uint256(rvm.loadVar(address(vault), "totalDeposits"));
+
+// Packed struct member
+uint128 fee = uint128(uint256(rvm.loadVar(address(vault), "config.feeNumerator")));
+
+// Mapping with keys
+uint256 bal = uint256(rvm.loadVar(address(vault), "balances", abi.encode(user)));
+
+// Nested mapping
+uint256 allow = uint256(rvm.loadVar(address(vault), "allowances", abi.encode(owner, spender)));
+
+// Raw packed extraction (no layout needed)
+bool paused = uint256(rvm.loadVar(address(vault), bytes32(uint256(0)), 0, 1)) != 0;
+```
+
+### Writing storage
+
+```solidity
+// Write by variable name
+rvm.storeVar(address(vault), "totalDeposits", bytes32(uint256(1000)));
+
+// Write packed struct member
+rvm.storeVar(address(vault), "config.paused", bytes32(uint256(1)));
+
+// Write mapping value
+rvm.storeVar(address(vault), "balances", abi.encode(user), bytes32(uint256(1 ether)));
+```
+
+### Layout registration
+
+For contracts deployed by your test harness (via `new`), storage layouts are **auto-registered** — no setup needed.
+
+For external contracts (proxies, fork mode, on-chain addresses):
+
+```solidity
+// Assign a known contract's layout to an address
+rvm.assignStorageLayout(address(proxy), "VaultImplementation");
+
+// Register layout manually (compact format)
+rvm.registerStorageLayout(address(proxy),
+    "uint256 totalDeposits, address owner, mapping(address => uint256) balances"
+);
+
+// Register layout manually (solc JSON format)
+rvm.registerStorageLayout(address(proxy), '{"storage":[...],"types":{...}}');
+```
+
+### ERC-7201 namespaced storage
+
+```solidity
+// Register by namespace string (computes ERC-7201 base slot automatically)
+rvm.registerNamespace(address(token), "openzeppelin.storage.ERC20",
+    "mapping(address => uint256) balances, mapping(address => mapping(address => uint256)) allowances, uint256 totalSupply"
+);
+
+// Then read normally — namespace is the path prefix
+uint256 supply = uint256(rvm.loadVar(address(token), "openzeppelin.storage.ERC20.totalSupply"));
+
+// Manual base slot (for non-ERC-7201 patterns)
+rvm.registerNamespace(address(token), 0x1234...00,
+    "uint256 value, address owner"
+);
+```
+
+### Compact layout format
+
+The compact format mirrors Solidity struct syntax:
+
+```
+"uint256 a, bool b, address c"                                    — flat fields
+"(uint128 lo, uint64 hi) config"                                  — inline struct
+"(uint16 b, (uint32 x, bool y) inner) mid"                       — nested struct
+"mapping(address => uint256) balances"                            — mapping
+"mapping(address => mapping(uint256 => bool)) approvals"          — nested mapping
+"uint256[] items"                                                  — dynamic array
+"(uint32 x, bool y)[3] fixedArr"                                  — fixed array of structs
+```
+
+All Solidity value types are supported: `uint8`–`uint256`, `int8`–`int256`, `bool`, `address`, `bytes1`–`bytes32`, `bytes`, `string`.
 
 ## Hot Reload
 
@@ -203,6 +303,10 @@ mutableOnly: false
 lcovEnable: false
 coverageMode: full
 shortcutsEnable: false
+filterFunctions:
+  - "Token.transfer(address,uint256)"
+  - "Token.approve(address,uint256)"
+filterBlacklist: true   # true = exclude listed (default), false = fuzz ONLY listed
 ```
 
 ```bash

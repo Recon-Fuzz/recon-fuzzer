@@ -13,6 +13,9 @@ use revm::{
 };
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use std::collections::HashMap;
+use std::sync::Arc;
+use crate::storage_layout::{StorageLayout, StorageEntry, StorageType, extract_packed};
+use crate::storage_layout_compact;
 
 // Re-export HEVM_ADDRESS from primitives for backwards compatibility
 pub use primitives::HEVM_ADDRESS;
@@ -28,14 +31,35 @@ sol! {
     function startPrank(address msgSender) external;
     function stopPrank() external;
     function store(address target, bytes32 slot, bytes32 value) external;
-    function load(address target, bytes32 slot) external returns (bytes32);
     function etch(address target, bytes code) external;
     function label(address account, string memory newLabel) external;
     function addr(uint256 privateKey) external returns (address);
     function sign(uint256 privateKey, bytes32 digest) external returns (uint8 v, bytes32 r, bytes32 s);
-    /// Generate random calls for reentrancy testing
-    /// Returns an array of calldata that can be executed via address(this).call()
     function generateCalls(uint256 count) external returns (bytes[] memory);
+
+    function load(address target, bytes32 slot) external returns (bytes32);
+    function loadVar(address target, string path) external returns (bytes32);
+    function loadVar(address target, string path, bytes keys) external returns (bytes32);
+    function loadVar(address target, bytes32 slot, uint8 offset, uint8 size) external returns (bytes32);
+
+    function storeVar(address target, string path, bytes32 value) external;
+    function storeVar(address target, string path, bytes keys, bytes32 value) external;
+    function storeVar(address target, bytes32 slot, uint8 offset, uint8 size, bytes32 value) external;
+
+    // --- Layout registration ---
+
+    /// Register a storage layout for a target address.
+    /// Accepts solc JSON or compact format:
+    ///   JSON:    '{"storage":[...],"types":{...}}'
+    ///   Compact: "uint256 a, (uint128 lo, bool flag) config, mapping(address => uint256) balances"
+    function registerStorageLayout(address target, string layout) external;
+    /// Assign a compiled contract's storage layout to a target address by name.
+    function assignStorageLayout(address target, string contractName) external;
+    /// Register a namespaced storage layout (ERC-7201).
+    /// Computes base slot from `ns` string, offsets all members.
+    function registerNamespace(address target, string ns, string layout) external;
+    /// Register a namespaced storage layout at a manual base slot.
+    function registerNamespace(address target, uint256 baseSlot, string layout) external;
 }
 
 /// Context for generating calls via `vm.generateCalls()`. Set before tx
@@ -104,6 +128,7 @@ pub struct CheatcodeState {
     pub roll_block: Option<U256>,
     /// Chain id override (vm.chainId)
     pub chain_id: Option<U256>,
+    pub has_opcode_cheatcodes: bool,
     /// Labels for addresses
     pub labels: HashMap<Address, String>,
     /// Whether assume failed (skip this tx)
@@ -156,6 +181,10 @@ pub struct CheatcodeInspector {
     /// Set if any sub-call halted with `InvalidFEOpcode` — the legacy
     /// (pre-0.8) encoding of `assert(false)`.
     pub nested_invalid_fe: bool,
+    /// Storage layouts keyed by contract address (for loadVar/loadVarKeys)
+    pub storage_layouts: Arc<HashMap<Address, StorageLayout>>,
+    /// Available layouts by contract name (for assignStorageLayout)
+    pub available_layouts: Arc<HashMap<String, StorageLayout>>,
 }
 
 /// Selector keccak256("Panic(uint256)")[..4] — Solidity 0.8+ Panic prefix.
@@ -176,6 +205,8 @@ impl CheatcodeInspector {
             generate_calls_ctx: None,
             nested_panic_1: false,
             nested_invalid_fe: false,
+            storage_layouts: Arc::new(HashMap::new()),
+            available_layouts: Arc::new(HashMap::new()),
         }
     }
 
@@ -318,6 +349,36 @@ impl CheatcodeInspector {
         encode_bytes_array(&returned)
     }
 
+    /// Resolve a storage path and read the value from the journal.
+    fn resolve_and_read<CTX: ContextTr>(
+        &self, context: &mut CTX, target: Address, path: &str, keys: &[u8],
+    ) -> Result<U256, String> {
+        use revm::context_interface::JournalTr;
+        let layout = self.storage_layouts.get(&target)
+            .ok_or_else(|| format!("no storage layout registered for {:?}", target))?;
+        let resolved = layout.resolve(path, keys).map_err(|e| format!("{}", e))?;
+        // Load account into journal first to avoid panics
+        if context.journal_mut().load_account_mut(target).is_err() {
+            return Err(format!("failed to load account {:?}", target));
+        }
+        let slot_revm = revm::primitives::U256::from_be_bytes(resolved.slot.to_be_bytes::<32>());
+        let raw = context.journal_mut().sload(target, slot_revm)
+            .map(|r| U256::from_be_bytes(r.data.to_be_bytes::<32>()))
+            .unwrap_or(U256::ZERO);
+        Ok(extract_packed(raw, resolved.offset, resolved.size))
+    }
+
+    /// Resolve a storage path and write a value via the journal.
+    fn resolve_and_write<CTX: ContextTr>(
+        &self, context: &mut CTX, target: Address, path: &str, keys: &[u8], value: U256,
+    ) -> Result<(), String> {
+        let layout = self.storage_layouts.get(&target)
+            .ok_or_else(|| format!("no storage layout registered for {:?}", target))?;
+        let resolved = layout.resolve(path, keys).map_err(|e| format!("{}", e))?;
+        write_packed_via_journal(context, target, resolved.slot, resolved.offset, resolved.size, value);
+        Ok(())
+    }
+
     /// Handle a cheatcode call
     pub fn handle_cheatcode(&mut self, input: &Bytes) -> Option<Bytes> {
         if input.len() < 4 {
@@ -330,6 +391,7 @@ impl CheatcodeInspector {
         if selector == warpCall::SELECTOR {
             if let Ok(decoded) = warpCall::abi_decode(input) {
                 self.state.warp_timestamp = Some(decoded.newTimestamp);
+                self.state.has_opcode_cheatcodes = true;
                 return Some(Bytes::new());
             }
         }
@@ -338,6 +400,7 @@ impl CheatcodeInspector {
         if selector == rollCall::SELECTOR {
             if let Ok(decoded) = rollCall::abi_decode(input) {
                 self.state.roll_block = Some(decoded.newNumber);
+                self.state.has_opcode_cheatcodes = true;
                 return Some(Bytes::new());
             }
         }
@@ -346,6 +409,7 @@ impl CheatcodeInspector {
         if selector == chainIdCall::SELECTOR {
             if let Ok(decoded) = chainIdCall::abi_decode(input) {
                 self.state.chain_id = Some(decoded.newChainId);
+                self.state.has_opcode_cheatcodes = true;
                 return Some(Bytes::new());
             }
         }
@@ -390,22 +454,14 @@ impl CheatcodeInspector {
             return Some(Bytes::new());
         }
 
-        // store(address, bytes32, bytes32)
+        // store(address, bytes32, bytes32) — handled in call() with journal access
         if selector == storeCall::SELECTOR {
-            if let Ok(decoded) = storeCall::abi_decode(input) {
-                self.state
-                    .stores
-                    .push((decoded.target, decoded.slot, decoded.value));
-                return Some(Bytes::new());
-            }
+            return None;
         }
 
-        // load(address, bytes32) - returns bytes32
-        // This is tricky because we need to actually read from storage
-        // For now, return zeros - proper implementation needs DB access
+        // load(address, bytes32) - handled in call() with context access
         if selector == loadCall::SELECTOR {
-            // Return 32 zero bytes
-            return Some(Bytes::from(vec![0u8; 32]));
+            return None;
         }
 
         // etch(address, bytes)
@@ -462,6 +518,10 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
     }
     
     fn step_end(&mut self, interp: &mut Interpreter<INTR>, _context: &mut CTX) {
+        if !self.state.has_opcode_cheatcodes {
+            self.last_opcode = 0;
+            return;
+        }
         // Handle vm.warp() - override TIMESTAMP opcode result
         // TIMESTAMP (0x42) pushes block.timestamp to stack
         // If warp is active, replace with our warped value
@@ -644,6 +704,158 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
                 }
             }
 
+            // Handle vm.load(address, bytes32) — read raw storage slot via journal
+            if input_data.len() >= 4 && &input_data[..4] == loadCall::SELECTOR {
+                if let Ok(decoded) = loadCall::abi_decode(&input_data) {
+                    let val = read_storage_via_journal(context, decoded.target, decoded.slot.into());
+                    return Some(make_return(val.to_be_bytes::<32>().to_vec(), inputs));
+                }
+            }
+
+            // Handle vm.store(address, bytes32, bytes32) — write raw storage slot via journal
+            if input_data.len() >= 4 && &input_data[..4] == storeCall::SELECTOR {
+                if let Ok(decoded) = storeCall::abi_decode(&input_data) {
+                    write_storage_via_journal(context, decoded.target, decoded.slot.into(), decoded.value.into());
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
+            // Handle vm.loadVar(address, bytes32, uint8, uint8)
+            if input_data.len() >= 4 && &input_data[..4] == loadVar_2Call::SELECTOR {
+                if let Ok(decoded) = loadVar_2Call::abi_decode(&input_data) {
+                    let raw = read_storage_via_journal(context, decoded.target, decoded.slot.into());
+                    let val = extract_packed(raw, decoded.offset as usize, decoded.size as usize);
+                    return Some(make_return(val.to_be_bytes::<32>().to_vec(), inputs));
+                }
+            }
+
+            // Handle vm.loadVar(address, string) — named path
+            if input_data.len() >= 4 && &input_data[..4] == loadVar_0Call::SELECTOR {
+                if let Ok(decoded) = loadVar_0Call::abi_decode(&input_data) {
+                    match self.resolve_and_read(context, decoded.target, &decoded.path, &[]) {
+                        Ok(val) => return Some(make_return(val.to_be_bytes::<32>().to_vec(), inputs)),
+                        Err(e) => {
+                            tracing::warn!("vm.load(path) failed: {}", e);
+                            return Some(make_return(U256::ZERO.to_be_bytes::<32>().to_vec(), inputs));
+                        }
+                    }
+                }
+            }
+
+            // Handle vm.loadVar(address, string, bytes) — named path + keys
+            if input_data.len() >= 4 && &input_data[..4] == loadVar_1Call::SELECTOR {
+                if let Ok(decoded) = loadVar_1Call::abi_decode(&input_data) {
+                    match self.resolve_and_read(context, decoded.target, &decoded.path, &decoded.keys) {
+                        Ok(val) => return Some(make_return(val.to_be_bytes::<32>().to_vec(), inputs)),
+                        Err(e) => {
+                            tracing::warn!("vm.load(path, keys) failed: {}", e);
+                            return Some(make_return(U256::ZERO.to_be_bytes::<32>().to_vec(), inputs));
+                        }
+                    }
+                }
+            }
+
+            // Handle vm.storeVar(address, string, bytes32) — named path write
+            if input_data.len() >= 4 && &input_data[..4] == storeVar_0Call::SELECTOR {
+                if let Ok(decoded) = storeVar_0Call::abi_decode(&input_data) {
+                    match self.resolve_and_write(context, decoded.target, &decoded.path, &[], decoded.value.into()) {
+                        Ok(()) => {}
+                        Err(e) => tracing::warn!("vm.storeVar(path) failed: {}", e),
+                    }
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
+            // Handle vm.storeVar(address, string, bytes, bytes32) — named path + keys write
+            if input_data.len() >= 4 && &input_data[..4] == storeVar_1Call::SELECTOR {
+                if let Ok(decoded) = storeVar_1Call::abi_decode(&input_data) {
+                    match self.resolve_and_write(context, decoded.target, &decoded.path, &decoded.keys, decoded.value.into()) {
+                        Ok(()) => {}
+                        Err(e) => tracing::warn!("vm.storeVar(path, keys) failed: {}", e),
+                    }
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
+            // Handle vm.storeVar(address, bytes32, uint8, uint8, bytes32) — packed write
+            if input_data.len() >= 4 && &input_data[..4] == storeVar_2Call::SELECTOR {
+                if let Ok(decoded) = storeVar_2Call::abi_decode(&input_data) {
+                    write_packed_via_journal(
+                        context, decoded.target, decoded.slot.into(),
+                        decoded.offset as usize, decoded.size as usize, decoded.value.into(),
+                    );
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
+            // Handle vm.registerStorageLayout(address, string)
+            if input_data.len() >= 4 && &input_data[..4] == registerStorageLayoutCall::SELECTOR {
+                if let Ok(decoded) = registerStorageLayoutCall::abi_decode(&input_data) {
+                    match parse_layout_string(&decoded.layout) {
+                        Ok(layout) => {
+                            Arc::make_mut(&mut self.storage_layouts).insert(decoded.target, layout);
+                            tracing::debug!("Registered storage layout for {:?}", decoded.target);
+                        }
+                        Err(e) => {
+                            tracing::warn!("vm.registerStorageLayout: {}", e);
+                        }
+                    }
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
+            // Handle vm.registerNamespace(address, string ns, string layout) — ERC-7201
+            if input_data.len() >= 4 && &input_data[..4] == registerNamespace_0Call::SELECTOR {
+                if let Ok(decoded) = registerNamespace_0Call::abi_decode(&input_data) {
+                    match parse_layout_string(&decoded.layout) {
+                        Ok(layout) => {
+                            let ns_layout = apply_namespace(&decoded.ns, layout);
+                            merge_namespace_layout(&mut self.storage_layouts, decoded.target, ns_layout);
+                            tracing::debug!("Registered namespace '{}' for {:?}", decoded.ns, decoded.target);
+                        }
+                        Err(e) => tracing::warn!("vm.registerNamespace: {}", e),
+                    }
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
+            // Handle vm.registerNamespace(address, uint256 baseSlot, string layout) — manual slot
+            if input_data.len() >= 4 && &input_data[..4] == registerNamespace_1Call::SELECTOR {
+                if let Ok(decoded) = registerNamespace_1Call::abi_decode(&input_data) {
+                    match parse_layout_string(&decoded.layout) {
+                        Ok(layout) => {
+                            let ns_layout = apply_namespace_at(decoded.baseSlot, layout);
+                            merge_namespace_layout(&mut self.storage_layouts, decoded.target, ns_layout);
+                            tracing::debug!("Registered namespace at slot {} for {:?}", decoded.baseSlot, decoded.target);
+                        }
+                        Err(e) => tracing::warn!("vm.registerNamespace: {}", e),
+                    }
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
+            // Handle vm.assignStorageLayout(address, string)
+            if input_data.len() >= 4 && &input_data[..4] == assignStorageLayoutCall::SELECTOR {
+                if let Ok(decoded) = assignStorageLayoutCall::abi_decode(&input_data) {
+                    let name = &decoded.contractName;
+                    // Exact match first, then suffix match with ":{name}"
+                    let layout = self.available_layouts.get(name.as_str()).cloned()
+                        .or_else(|| {
+                            let suffix = format!(":{}", name);
+                            self.available_layouts.iter()
+                                .find(|(k, _)| k.ends_with(&suffix))
+                                .map(|(_, v)| v.clone())
+                        });
+                    if let Some(layout) = layout {
+                        Arc::make_mut(&mut self.storage_layouts).insert(decoded.target, layout);
+                        tracing::info!("Assigned storage layout '{}' to {:?}", name, decoded.target);
+                    } else {
+                        tracing::warn!("vm.assignStorageLayout: no layout found for '{}'", name);
+                    }
+                    return Some(make_return(Vec::new(), inputs));
+                }
+            }
+
             // Handle other cheatcodes that don't need DB access
             let result = self.handle_cheatcode(&input_data).unwrap_or_else(|| {
                 // Unknown cheatcode - log it and return empty success
@@ -775,6 +987,187 @@ impl<CTX: ContextTr, INTR: InterpreterTypes> Inspector<CTX, INTR> for CheatcodeI
     }
 }
 
+fn read_storage_via_journal<CTX: ContextTr>(context: &mut CTX, target: Address, slot: U256) -> U256 {
+    use revm::context_interface::JournalTr;
+    if context.journal_mut().load_account_mut(target).is_err() {
+        return U256::ZERO;
+    }
+    let slot_revm = revm::primitives::U256::from_be_bytes(slot.to_be_bytes::<32>());
+    context.journal_mut().sload(target, slot_revm)
+        .map(|r| U256::from_be_bytes(r.data.to_be_bytes::<32>()))
+        .unwrap_or(U256::ZERO)
+}
+
+fn write_storage_via_journal<CTX: ContextTr>(context: &mut CTX, target: Address, slot: U256, value: U256) {
+    use revm::context_interface::JournalTr;
+    if context.journal_mut().load_account_mut(target).is_err() {
+        return;
+    }
+    let slot_revm = revm::primitives::U256::from_be_bytes(slot.to_be_bytes::<32>());
+    let val_revm = revm::primitives::U256::from_be_bytes(value.to_be_bytes::<32>());
+    let _ = context.journal_mut().sstore(target, slot_revm, val_revm);
+}
+
+/// Write a packed value into a storage slot: read the slot, mask out the old
+/// bits at (offset, size), insert the new value, write back.
+fn write_packed_via_journal<CTX: ContextTr>(
+    context: &mut CTX, target: Address, slot: U256,
+    offset: usize, size: usize, value: U256,
+) {
+    let raw = read_storage_via_journal(context, target, slot);
+    let shift = offset * 8;
+    let mask = if size >= 32 {
+        U256::MAX
+    } else {
+        (U256::from(1) << (size * 8)) - U256::from(1)
+    };
+    // Clear the target bits, insert new value
+    let cleared = raw & !(mask << shift);
+    let new_val = cleared | ((value & mask) << shift);
+    write_storage_via_journal(context, target, slot, new_val);
+}
+
+fn make_return(output: Vec<u8>, inputs: &CallInputs) -> CallOutcome {
+    CallOutcome {
+        result: InterpreterResult {
+            result: InstructionResult::Return,
+            output: Bytes::from(output),
+            gas: Gas::new(inputs.gas_limit),
+        },
+        memory_offset: inputs.return_memory_offset.clone(),
+        precompile_call_logs: vec![],
+        was_precompile_called: false,
+        charged_new_account_state_gas: false,
+    }
+}
+
+/// Parse a layout string — tries JSON first, falls back to compact format.
+fn parse_layout_string(input: &str) -> Result<StorageLayout, String> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('{') {
+        serde_json::from_str::<StorageLayout>(trimmed)
+            .map_err(|e| format!("invalid JSON: {}", e))
+    } else {
+        storage_layout_compact::parse_compact(trimmed)
+            .map_err(|e| format!("invalid compact format: {}", e))
+    }
+}
+
+/// Compute ERC-7201 namespace base slot and offset all storage entries.
+///
+/// Base slot = `keccak256(abi.encode(uint256(keccak256(ns)) - 1)) & ~bytes32(uint256(0xff))`
+///
+/// Each storage entry's slot is offset by the base. The namespace name
+/// becomes a prefix: entry "value" becomes "ns.value" so `loadVar` can
+/// resolve "example.main.value".
+fn apply_namespace(ns: &str, layout: StorageLayout) -> StorageLayout {
+    use alloy_primitives::keccak256;
+
+    let ns_hash = keccak256(ns.as_bytes());
+    let ns_val = U256::from_be_bytes(ns_hash.0).wrapping_sub(U256::from(1));
+    let encoded = ns_val.to_be_bytes::<32>();
+    let slot_hash = keccak256(&encoded);
+    let mut base_bytes = slot_hash.0;
+    base_bytes[31] = 0;
+    let base_slot = U256::from_be_bytes(base_bytes);
+
+    // Create a synthetic struct type with the layout's storage entries as members.
+    // The struct is placed at the ERC-7201 base slot. This way the path resolver
+    // sees "example.main" as a top-level variable and ".value" as a struct member.
+    let type_id = format!("t_ns_{}", ns.replace('.', "_"));
+    let mut types = layout.types;
+
+    // Compute total size from members
+    let total_size: usize = layout.storage.iter().map(|e| {
+        let ty = types.get(&e.type_id);
+        let slot: usize = e.slot.parse().unwrap_or(0);
+        let size: usize = ty.map(|t| t.number_of_bytes.parse().unwrap_or(32)).unwrap_or(32);
+        slot * 32 + e.offset + size
+    }).max().unwrap_or(32);
+    let total_slots = (total_size + 31) / 32;
+
+    types.insert(
+        type_id.clone(),
+        StorageType {
+            encoding: "inplace".into(),
+            label: format!("namespace {}", ns),
+            number_of_bytes: (total_slots * 32).to_string(),
+            key: None,
+            value: None,
+            base: None,
+            members: Some(layout.storage),
+        },
+    );
+
+    let storage = vec![StorageEntry {
+        label: ns.to_string(),
+        offset: 0,
+        slot: base_slot.to_string(),
+        type_id,
+        contract: None,
+    }];
+
+    StorageLayout { storage, types }
+}
+
+/// Merge a namespace layout into the storage layouts map for a target address.
+fn merge_namespace_layout(
+    storage_layouts: &mut Arc<HashMap<Address, StorageLayout>>,
+    target: Address,
+    ns_layout: StorageLayout,
+) {
+    let layouts = Arc::make_mut(storage_layouts);
+    let existing = layouts.entry(target).or_insert_with(|| {
+        StorageLayout { storage: Vec::new(), types: std::collections::HashMap::new() }
+    });
+    for entry in ns_layout.storage {
+        existing.storage.push(entry);
+    }
+    for (k, v) in ns_layout.types {
+        existing.types.insert(k, v);
+    }
+}
+
+/// Apply a manual base slot to a layout (no ERC-7201 computation).
+/// The slot number from the layout entry becomes an offset label (e.g. "ns_0x1234").
+fn apply_namespace_at(base_slot: U256, layout: StorageLayout) -> StorageLayout {
+    let label = format!("ns_{:#x}", base_slot);
+
+    let type_id = format!("t_ns_{}", label.replace('.', "_"));
+    let mut types = layout.types;
+
+    let total_size: usize = layout.storage.iter().map(|e| {
+        let ty = types.get(&e.type_id);
+        let slot: usize = e.slot.parse().unwrap_or(0);
+        let size: usize = ty.map(|t| t.number_of_bytes.parse().unwrap_or(32)).unwrap_or(32);
+        slot * 32 + e.offset + size
+    }).max().unwrap_or(32);
+    let total_slots = (total_size + 31) / 32;
+
+    types.insert(
+        type_id.clone(),
+        StorageType {
+            encoding: "inplace".into(),
+            label: format!("namespace {}", label),
+            number_of_bytes: (total_slots * 32).to_string(),
+            key: None,
+            value: None,
+            base: None,
+            members: Some(layout.storage),
+        },
+    );
+
+    let storage = vec![StorageEntry {
+        label,
+        offset: 0,
+        slot: base_slot.to_string(),
+        type_id,
+        contract: None,
+    }];
+
+    StorageLayout { storage, types }
+}
+
 /// Encode a bytes[] array for ABI return
 fn encode_bytes_array(calls: &[Bytes]) -> Bytes {
     use alloy_dyn_abi::DynSolValue;
@@ -807,4 +1200,39 @@ mod tests {
         assert_eq!(selector.len(), 4);
     }
 
+    #[test]
+    fn test_namespace_base_slot() {
+        let layout = StorageLayout { storage: vec![], types: std::collections::HashMap::new() };
+        let result = apply_namespace("example.main", layout);
+        assert_eq!(result.storage.len(), 1);
+        assert_eq!(result.storage[0].label, "example.main");
+        let base: U256 = result.storage[0].slot.parse().unwrap();
+        assert_eq!(
+            format!("{:#066x}", base),
+            "0x183a6125c38840424c4a85fa12bab2ab606c4b6d0e7cc73c0c06ba5300eab500"
+        );
+    }
+
+    #[test]
+    fn test_namespace_offsets_slots() {
+        use crate::storage_layout_compact::parse_compact;
+        let layout = parse_compact("uint256 value, address owner").unwrap();
+        let result = apply_namespace("example.main", layout);
+        // Single top-level entry for the namespace
+        assert_eq!(result.storage.len(), 1);
+        assert_eq!(result.storage[0].label, "example.main");
+        // Base slot matches ERC-7201 computation
+        let base_slot: U256 = result.storage[0].slot.parse().unwrap();
+        assert_eq!(
+            format!("{:#066x}", base_slot),
+            "0x183a6125c38840424c4a85fa12bab2ab606c4b6d0e7cc73c0c06ba5300eab500"
+        );
+        // Resolve through the struct: "example.main.value" and "example.main.owner"
+        let r_val = result.resolve("example.main.value", &[]).unwrap();
+        assert_eq!(r_val.slot, base_slot);
+        assert_eq!(r_val.size, 32);
+        let r_own = result.resolve("example.main.owner", &[]).unwrap();
+        assert_eq!(r_own.slot, base_slot + U256::from(1));
+        assert_eq!(r_own.size, 20);
+    }
 }

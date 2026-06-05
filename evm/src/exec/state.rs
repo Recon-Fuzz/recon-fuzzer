@@ -8,6 +8,8 @@ use revm::bytecode::Bytecode;
 use revm::context_interface::result::{ExecutionResult, Output};
 use revm::state::AccountInfo;
 use revm::Database;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::EvmState;
 
@@ -167,5 +169,68 @@ impl EvmState {
     pub fn get_storage(&mut self, addr: Address, slot: U256) -> Option<U256> {
         // Use Database trait's storage method
         self.db.storage(addr, slot).ok()
+    }
+
+    /// Register a storage layout for a specific address.
+    /// Merge storage layouts from an inspector back into EvmState.
+    /// Called after tx execution to persist layouts registered via
+    /// vm.registerStorageLayout / vm.registerNamespace / vm.assignStorageLayout.
+    pub fn merge_storage_layouts_from(&mut self, inspector_layouts: &Arc<HashMap<Address, crate::storage_layout::StorageLayout>>) {
+        if Arc::ptr_eq(inspector_layouts, &self.storage_layouts) {
+            return;
+        }
+        for (addr, layout) in inspector_layouts.iter() {
+            let dominated = match self.storage_layouts.get(addr) {
+                None => true,
+                Some(existing) => layout.storage.len() > existing.storage.len(),
+            };
+            if dominated {
+                Arc::make_mut(&mut self.storage_layouts).insert(*addr, layout.clone());
+            }
+        }
+    }
+
+    pub fn register_storage_layout(&mut self, addr: Address, layout: crate::storage_layout::StorageLayout) {
+        Arc::make_mut(&mut self.storage_layouts).insert(addr, layout);
+    }
+
+    /// Auto-register storage layouts for newly created addresses by matching
+    /// deployed bytecode metadata hashes against known compiled contracts.
+    pub fn auto_register_storage_layouts(&mut self) {
+        if self.last_created_addresses.is_empty() || self.layout_by_metadata.is_empty() {
+            return;
+        }
+        for addr in self.last_created_addresses.clone() {
+            if self.storage_layouts.contains_key(&addr) { continue; }
+            let runtime_bytes = match self.db.get_code(addr) {
+                Some(code) if !code.is_empty() => code,
+                _ => continue,
+            };
+            let metadata_hash = crate::coverage::compute_metadata_hash(&runtime_bytes);
+            if let Some((name, layout)) = self.layout_by_metadata.get(&metadata_hash) {
+                if layout.storage.is_empty() { continue; }
+                Arc::make_mut(&mut self.storage_layouts).insert(addr, layout.clone());
+                tracing::debug!("Auto-registered storage layout for {:?} ({})", addr, name);
+            }
+        }
+    }
+
+    /// Populate `available_layouts` and `layout_by_metadata` from compiled contracts.
+    /// Called once at startup after `load_storage_layouts()`.
+    pub fn set_available_layouts(&mut self, contracts: &[crate::foundry::CompiledContract]) {
+        let mut name_map = std::collections::HashMap::new();
+        let mut meta_map = std::collections::HashMap::new();
+        for c in contracts {
+            if let Some(layout) = &c.storage_layout {
+                name_map.insert(c.name.clone(), layout.clone());
+                name_map.insert(c.qualified_name.clone(), layout.clone());
+                if !c.deployed_bytecode.is_empty() {
+                    let mh = crate::coverage::compute_metadata_hash(&c.deployed_bytecode);
+                    meta_map.insert(mh, (c.name.clone(), layout.clone()));
+                }
+            }
+        }
+        self.available_layouts = Arc::new(name_map);
+        self.layout_by_metadata = Arc::new(meta_map);
     }
 }

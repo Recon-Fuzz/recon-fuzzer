@@ -133,6 +133,16 @@ struct FuzzArgs {
     #[arg(long)]
     mutable_only: bool,
 
+    /// Functions to filter from fuzzing (echidna `filterFunctions`).
+    /// Format: "Contract.func(type1,type2)". Repeatable.
+    #[arg(long)]
+    filter_functions: Vec<String>,
+
+    /// Treat --filter-functions as a whitelist (fuzz ONLY those). Default is a
+    /// blacklist (exclude those), matching echidna's `filterBlacklist: true`.
+    #[arg(long)]
+    filter_whitelist: bool,
+
     /// Replay a corpus file and show traces (e.g., --replay echidna/reproducers/foo.txt)
     #[arg(long)]
     replay: Option<PathBuf>,
@@ -315,6 +325,14 @@ struct FlatConfig {
     all_contracts: Option<bool>,
     #[serde(rename = "mutableOnly")]
     mutable_only: Option<bool>,
+    /// Echidna-compatible: functions to filter from fuzzing, as canonical
+    /// `Contract.func(types)` signatures.
+    #[serde(rename = "filterFunctions")]
+    filter_functions: Option<Vec<String>>,
+    /// Echidna-compatible: treat `filterFunctions` as a blacklist (default) or
+    /// whitelist (`false`).
+    #[serde(rename = "filterBlacklist")]
+    filter_blacklist: Option<bool>,
     /// Echidna-compatible: initial ETH balance funded into deployer/senders.
     #[serde(
         rename = "balanceAddr",
@@ -535,6 +553,12 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         if let Some(mutable) = flat.mutable_only {
             config.sol_conf.mutable_only = mutable;
         }
+        if let Some(funcs) = flat.filter_functions {
+            config.sol_conf.filter_functions = funcs;
+        }
+        if let Some(blacklist) = flat.filter_blacklist {
+            config.sol_conf.filter_blacklist = blacklist;
+        }
         if let Some(bal) = flat.balance_addr {
             config.sol_conf.balance_addr = Some(bal);
         }
@@ -601,6 +625,12 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
     }
     if args.mutable_only {
         config.sol_conf.mutable_only = true;
+    }
+    if !args.filter_functions.is_empty() {
+        config.sol_conf.filter_functions = args.filter_functions.clone();
+    }
+    if args.filter_whitelist {
+        config.sol_conf.filter_blacklist = false;
     }
     if args.lcov {
         config.campaign_conf.lcov_enable = true;
@@ -698,14 +728,32 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
             info!("Hot reload: reinitializing campaign with new bytecode...");
         }
 
-        // Compile project
-        info!("Compiling project...");
-        let mut project =
-            FoundryProject::compile(&args.project).context("Failed to compile project")?;
+        // Compile project (hot reload: watcher already ran forge build, just parse artifacts)
+        let mut project = if is_reload {
+            info!("Loading recompiled artifacts...");
+            FoundryProject::load(&args.project).context("Failed to load project artifacts")?
+        } else {
+            info!("Compiling project...");
+            FoundryProject::compile(&args.project).context("Failed to compile project")?
+        };
 
         if project.contracts.is_empty() {
             error!("No contracts found in project");
             return Ok(());
+        }
+
+        // Check if storageLayout is present in artifacts. Forge caches builds
+        // and won't regenerate artifacts when only --extra-output changes.
+        // If missing, forge clean to bust the cache and recompile.
+        let has_storage_layout = project.contracts.iter().any(|c| c.storage_layout.is_some());
+        if !has_storage_layout {
+            info!("storageLayout missing from artifacts (stale cache), running forge clean...");
+            let _ = std::process::Command::new("forge")
+                .arg("clean")
+                .current_dir(&args.project)
+                .output();
+            project = FoundryProject::compile(&args.project)
+                .context("Failed to recompile project after forge clean")?;
         }
 
         info!("Found {} contracts", project.contracts.len());
@@ -776,18 +824,19 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                     }
                 }
 
-                // Rebuild project with --build-info
+                // Rebuild and reload artifacts (reuses FoundryProject::compile
+                // which runs forge build --build-info --extra-output storageLayout)
                 info!("Rebuilding project with --build-info...");
-                let rebuild_result = std::process::Command::new("forge")
-                    .arg("build")
-                    .arg("--build-info")
-                    .arg("-o")
-                    .arg("out")
-                    .current_dir(&args.project)
-                    .output();
+                let rebuild_result = FoundryProject::compile(&args.project);
 
                 match rebuild_result {
-                    Ok(output) if output.status.success() => {
+                    Ok(reloaded) => {
+                        project = reloaded;
+                        // Re-find main contract from refreshed artifacts
+                        main_contract = find_contract(&project.contracts, args.contract.as_deref())
+                            .context("Contract not found after rebuild")?
+                            .clone();
+
                         // Retry recon-generate info
                         match analysis::slither::SlitherInfo::load_from_recon_generate(
                             &project_path,
@@ -834,13 +883,8 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                             }
                         }
                     }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!("forge build --build-info failed: {}. Fuzzing will continue with bytecode constants only.", stderr);
-                        None
-                    }
                     Err(rebuild_err) => {
-                        warn!("Failed to run forge build: {}. Original error: {}. Fuzzing will continue with bytecode constants only.", rebuild_err, e);
+                        warn!("Rebuild failed: {}. Original error: {}. Fuzzing will continue with bytecode constants only.", rebuild_err, e);
                         None
                     }
                 }
@@ -870,6 +914,47 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
                     excluded
                 );
                 main_contract.exclude_from_fuzzing = excluded.to_vec();
+            }
+        }
+
+        // Apply Echidna-style function filter (filterFunctions / filterBlacklist).
+        // Entries are namespaced by contract (`Contract.func(types)`), so the same
+        // filter is safely stamped onto every loaded contract; each keeps only the
+        // entries naming it. The filter is enforced inside CompiledContract::
+        // fuzzable_functions[_smart] — the single choke point every transaction-
+        // generation path draws from — so it covers main and (future) all-contracts.
+        if !config.sol_conf.filter_functions.is_empty() {
+            let filter = evm::foundry::FunctionFilter {
+                blacklist: config.sol_conf.filter_blacklist,
+                functions: config.sol_conf.filter_functions.clone(),
+            };
+            info!(
+                "Function filter active ({}): {:?}",
+                if filter.blacklist {
+                    "blacklist — excluding these"
+                } else {
+                    "whitelist — fuzzing only these"
+                },
+                filter.functions
+            );
+            main_contract.fuzz_filter = filter.clone();
+            for contract in project.contracts.iter_mut() {
+                contract.fuzz_filter = filter.clone();
+            }
+
+            // Warn loudly if a whitelist removed every fuzzable function on the
+            // main contract — that would silently produce a no-op campaign.
+            if !filter.blacklist
+                && main_contract
+                    .fuzzable_functions(config.sol_conf.mutable_only)
+                    .is_empty()
+            {
+                warn!(
+                    "filterFunctions whitelist matched no fuzzable functions on '{}' — \
+                     no functions will be called. Check the canonical signatures \
+                     (e.g. \"{}.func(uint256)\").",
+                    main_contract.name, main_contract.name
+                );
             }
         }
 
@@ -1125,6 +1210,11 @@ fn run_fuzz(args: FuzzArgs) -> Result<()> {
         } else {
             println!("Contract has no constructor (or empty constructor)");
         }
+
+        // Populate storage layout registries from compiled artifacts.
+        // Layouts are parsed from the artifact JSON (forge build --extra-output storageLayout).
+        // Must happen before deployment so auto_register works for constructor-created contracts.
+        vm.set_available_layouts(&project.contracts);
 
         // Deploy with automatic library linking. The constructor msg.value is the
         // configured `balanceContract` (echidna semantics), so `address(this).balance`

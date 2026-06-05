@@ -17,6 +17,80 @@ use crate::exec::EvmState;
 // Keep Libraries type for API compatibility, but we don't use foundry-linking
 type Libraries = std::collections::BTreeMap<PathBuf, std::collections::BTreeMap<String, String>>;
 
+/// Echidna-style function filter applied to the fuzzable function set.
+///
+/// Mirrors Echidna's `filterFunctions` + `filterBlacklist` config knobs:
+/// - `blacklist == true` (Echidna's default): the listed functions are
+///   EXCLUDED from fuzzing; everything else is fuzzed.
+/// - `blacklist == false` (whitelist): ONLY the listed functions are fuzzed.
+///
+/// Entries use Echidna's canonical form `Contract.func(type1,type2)`. For
+/// convenience we additionally accept looser forms — the bare signature
+/// `func(types)`, the qualified name `Contract.func`, and the bare name
+/// `func` — so any entry Echidna would match, we match too.
+///
+/// An empty `functions` list means the filter is inactive (no-op) regardless
+/// of `blacklist`, which keeps the default and the degenerate empty-whitelist
+/// case from silently disabling all fuzzing.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionFilter {
+    /// When true, `functions` is a blacklist (exclude); when false, a whitelist
+    /// (include only). Echidna's `filterBlacklist`, default `true`.
+    pub blacklist: bool,
+    /// Function identifiers to match, e.g. `["Token.transfer(address,uint256)"]`.
+    pub functions: Vec<String>,
+}
+
+impl FunctionFilter {
+    /// True when the filter actually constrains the function set.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        !self.functions.is_empty()
+    }
+
+    /// Whether `func` on contract `contract_name` should be kept for fuzzing.
+    pub fn allows(&self, contract_name: &str, func: &Function) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        let listed = self.matches(contract_name, func);
+        // blacklist: keep when NOT listed; whitelist: keep when listed.
+        if self.blacklist {
+            !listed
+        } else {
+            listed
+        }
+    }
+
+    /// True if `func` matches any configured entry, in any accepted form.
+    fn matches(&self, contract_name: &str, func: &Function) -> bool {
+        // Canonical comma-joined Solidity type list, e.g. "address,uint256"
+        // (uses resolved types so tuples render as "(uint128,uint128)" rather
+        // than the bare "tuple" you'd get from Param::ty).
+        let types = func
+            .inputs
+            .iter()
+            .map(|p| {
+                p.resolve()
+                    .map(|t| t.sol_type_name().to_string())
+                    .unwrap_or_else(|_| p.ty.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sig = format!("{}({})", func.name, types);
+        let qualified_sig = format!("{}.{}", contract_name, sig);
+        let qualified_name = format!("{}.{}", contract_name, func.name);
+
+        self.functions.iter().any(|e| {
+            let e = e.trim();
+            e == qualified_sig   // Contract.func(types)  — Echidna canonical
+                || e == sig          // func(types)
+                || e == qualified_name // Contract.func
+                || e == func.name // func
+        })
+    }
+}
+
 /// Compiled contract from Foundry
 #[derive(Debug, Clone)]
 pub struct CompiledContract {
@@ -55,12 +129,20 @@ pub struct CompiledContract {
     /// Contains function names WITHOUT parameters
     pub exclude_from_fuzzing: Vec<String>,
 
+    /// Echidna-style function filter (`filterFunctions` + `filterBlacklist`).
+    /// Inactive by default (empty list = fuzz everything).
+    pub fuzz_filter: FunctionFilter,
+
     /// Foundry artifact's top-level `id` field — the file id of this contract's
     /// own source within the build-info that compiled it. Combined with
     /// `source_path` it disambiguates which build-info this artifact belongs
     /// to so source-map file ids can be remapped correctly when multiple
     /// build-info JSON files coexist (different solc versions / profiles).
     pub source_file_id: Option<i32>,
+
+    /// Parsed storage layout from `forge inspect`. Populated by
+    /// `load_storage_layouts()` at startup; `None` for interfaces/libraries.
+    pub storage_layout: Option<crate::storage_layout::StorageLayout>,
 }
 
 impl CompiledContract {
@@ -118,6 +200,8 @@ impl CompiledContract {
             .filter(|f| !Self::is_foundry_internal(&f.name))
             // Filter out excluded functions (matched by name without params)
             .filter(|f| !self.exclude_from_fuzzing.iter().any(|excluded| excluded == &f.name))
+            // Apply Echidna-style filterFunctions/filterBlacklist
+            .filter(|f| self.fuzz_filter.allows(&self.name, f))
             .collect()
     }
     
@@ -145,6 +229,11 @@ impl CompiledContract {
 
                 // Filter out excluded functions (matched by name without params)
                 if self.exclude_from_fuzzing.iter().any(|excluded| excluded == &f.name) {
+                    return false;
+                }
+
+                // Apply Echidna-style filterFunctions/filterBlacklist
+                if !self.fuzz_filter.allows(&self.name, f) {
                     return false;
                 }
 
@@ -204,6 +293,9 @@ struct FoundryArtifact {
     /// when multiple build-info files coexist.
     #[serde(default)]
     id: Option<i32>,
+    /// Solc storage layout (available when built with `--extra-output storageLayout`).
+    #[serde(rename = "storageLayout", default)]
+    storage_layout: Option<crate::storage_layout::StorageLayout>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +313,8 @@ pub fn compile_project(project_path: &Path) -> Result<Vec<CompiledContract>> {
     let output = Command::new("forge")
         .arg("build")
         .arg("--build-info")
+        .arg("--extra-output")
+        .arg("storageLayout")
         .arg("-o")
         .arg("out")
         .current_dir(project_path)
@@ -377,7 +471,9 @@ fn parse_single_artifact(path: &Path, name: &str) -> Result<Option<CompiledContr
         init_source_map: artifact.bytecode.source_map,
         resolved_param_types,
         exclude_from_fuzzing: Vec::new(),
+        fuzz_filter: FunctionFilter::default(),
         source_file_id: artifact.id,
+        storage_layout: artifact.storage_layout,
     }))
 }
 
@@ -400,6 +496,8 @@ fn parse_bytecode_with_placeholders(object: &str) -> Result<Bytes> {
     Ok(Bytes::from(bytes))
 }
 
+/// Load storage layouts for all contracts by calling `forge inspect <name> storageLayout --json`.
+/// Called once at startup. Contracts whose layout can't be loaded (interfaces, libraries) are skipped.
 /// Extract all __$hash$__ placeholders from a bytecode hex string
 /// Returns a set of unique hashes (the 34-char string between __$ and $__)
 fn extract_library_placeholders(bytecode_hex: &str) -> HashSet<String> {
@@ -484,11 +582,13 @@ impl FoundryProject {
     /// Compile and prepare for linking
     pub fn compile(project_path: &Path) -> Result<Self> {
         info!("Compiling Foundry project at {:?}", project_path);
-        
+
         // Run forge build first
         let output = Command::new("forge")
             .arg("build")
             .arg("--build-info")
+            .arg("--extra-output")
+            .arg("storageLayout")
             .arg("-o")
             .arg("out")
             .current_dir(project_path)
@@ -499,7 +599,13 @@ impl FoundryProject {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("forge build failed: {}", stderr));
         }
-        
+
+        Self::load(project_path)
+    }
+
+    /// Load already-compiled artifacts from `out/` without running `forge build`.
+    /// Use after an external build (e.g. hot reload watcher) has already compiled.
+    pub fn load(project_path: &Path) -> Result<Self> {
         // Parse all artifacts to find contracts and libraries
         let out_dir = project_path.join("out");
         let mut contracts = Vec::new();
